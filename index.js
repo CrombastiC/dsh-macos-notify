@@ -3,7 +3,7 @@ import { basename } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'dsh-macos-notify'
-export const inject = ['sessions']
+export const inject = ['sessions', 'settings']
 
 export const Config = Schema.object({
   /** 轮次正常完成时通知 */
@@ -38,6 +38,9 @@ export const Config = Schema.object({
   /** 插件加载时发一条测试通知 */
   notifyOnLoad: Schema.boolean().default(true),
 })
+
+/** 设置页可编辑的提示音字段 */
+const SOUND_KINDS = ['completed', 'error', 'aborted', 'approval']
 
 function esc(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
@@ -92,6 +95,11 @@ function idleSeconds() {
 }
 
 export function apply(ctx, config) {
+  // 配置三层叠加：schema 默认值 < cordis 组合层（base = 插件 config）< 用户层（设置页）。
+  // 设置页写入后经 watch 实时生效，不需要重启。
+  const scope = ctx.settings.register('macos-notify', Config, { base: config, applies: 'live' })
+  let current = scope.get()
+
   // sessionId -> 最新标题（session/title 事件是 latest-wins 快照）
   const titles = new Map()
   // sessionId -> 本轮 turn/start 的时间戳，用于算轮次时长
@@ -103,9 +111,13 @@ export function apply(ctx, config) {
   let flushTimer = null
   // digest 通道：只攒「完成」
   let digestPending = []
+  let digestTimer = null
 
   // 通知通道：auto 在支持的终端里走 OSC 9（终端自己转系统通知），否则 osascript
-  const resolvedChannel = config.channel === 'auto' ? (supportsOsc9() ? 'osc9' : 'osascript') : config.channel
+  let resolvedChannel = resolveChannel()
+  function resolveChannel() {
+    return current.channel === 'auto' ? (supportsOsc9() ? 'osc9' : 'osascript') : current.channel
+  }
   const send = (title, body, sound) => notify(title, body, sound, resolvedChannel)
 
   // 上报「正在看 dsh tab」的浏览器客户端：id -> 最近一次聚焦上报的时间戳
@@ -120,17 +132,25 @@ export function apply(ctx, config) {
     return focusedClients.size > 0
   }
 
-  // 接收浏览器半的焦点上报。connection 服务只在 web profile 存在，
+  // 接收浏览器半的焦点上报与试听请求。connection 服务只在 web profile 存在，
   // 用 ctx.inject() 延迟挂载：headless 下回调永不触发（视为无人盯着，通知照发）
   ctx.inject(['connection'], (connCtx) => {
     connCtx.connection.rpc.intercept(
       '/api',
-      (endpoint) => endpoint === 'macos-notify/visibility',
-      async (_endpoint, payload) => {
-        const { id, focused } = payload ?? {}
-        if (typeof id === 'string') {
-          if (focused) focusedClients.set(id, Date.now())
-          else focusedClients.delete(id)
+      (endpoint) => endpoint === 'macos-notify/visibility' || endpoint === 'macos-notify/test',
+      async (endpoint, payload) => {
+        if (endpoint === 'macos-notify/visibility') {
+          const { id, focused } = payload ?? {}
+          if (typeof id === 'string') {
+            if (focused) focusedClients.set(id, Date.now())
+            else focusedClients.delete(id)
+          }
+          return { ok: true, value: null }
+        }
+        // macos-notify/test：设置页的「试听」按钮，立即发一条带对应提示音的测试通知
+        const kind = payload?.kind
+        if (SOUND_KINDS.includes(kind)) {
+          send('试听', `这是「${kind}」事件的提示音`, current.sounds[kind])
         }
         return { ok: true, value: null }
       },
@@ -148,15 +168,15 @@ export function apply(ctx, config) {
   }
 
   // 「完成」类（纯 completed 的一批）过两道闸：焦点抑制 + 键鼠空闲抑制
-  const gateAndNotify = async (items, send) => {
+  const gateAndNotify = async (items, sendBatch) => {
     if (items.every((i) => i.kind === '完成')) {
-      if (config.onlyWhenUnfocused && anyFocused()) return
-      if (config.onlyWhenIdleSec > 0) {
+      if (current.onlyWhenUnfocused && anyFocused()) return
+      if (current.onlyWhenIdleSec > 0) {
         const idle = await idleSeconds()
-        if (idle < config.onlyWhenIdleSec) return
+        if (idle < current.onlyWhenIdleSec) return
       }
     }
-    send()
+    sendBatch()
   }
 
   const render = (items) => {
@@ -198,33 +218,46 @@ export function apply(ctx, config) {
       send(
         `${items.length} 个任务完成`,
         `${names}${more}${runningSuffix()}`,
-        config.sounds.completed,
+        current.sounds.completed,
       )
     })
   }
 
-  // digest 定时器常驻，到点攒了多少发多少；卸载时统一清理
-  const digestTimer = config.digestMinutes > 0
-    ? setInterval(flushDigest, config.digestMinutes * 60_000)
-    : null
+  const setupDigest = () => {
+    if (digestTimer) {
+      clearInterval(digestTimer)
+      digestTimer = null
+    }
+    if (current.digestMinutes > 0) {
+      digestTimer = setInterval(flushDigest, current.digestMinutes * 60_000)
+    }
+  }
+  setupDigest()
+
+  // 设置页写入实时生效：换配置快照、重算通道、按新间隔重建 digest 定时器
+  scope.watch((next) => {
+    current = next
+    resolvedChannel = resolveChannel()
+    setupDigest()
+  })
 
   const enqueue = (kind, title, body, sound, session) => {
-    if (kind === '完成' && config.digestMinutes > 0) {
+    if (kind === '完成' && current.digestMinutes > 0) {
       digestPending.push({ kind, title, body, sound, label: label(session) })
       return
     }
-    if (config.coalesceMs <= 0) {
+    if (current.coalesceMs <= 0) {
       void gateAndNotify([{ kind, title, body, sound, label: label(session) }], () => {
         send(title, body + runningSuffix(), sound)
       })
       return
     }
     pending.push({ kind, title, body, sound, label: label(session) })
-    if (!flushTimer) flushTimer = setTimeout(flush, config.coalesceMs)
+    if (!flushTimer) flushTimer = setTimeout(flush, current.coalesceMs)
   }
 
-  if (config.notifyOnLoad) {
-    send('DSH', 'macOS 通知插件已加载', config.sounds.completed)
+  if (current.notifyOnLoad) {
+    send('DSH', 'macOS 通知插件已加载', current.sounds.completed)
   }
 
   ctx.on('session/event', (session, event) => {
@@ -233,7 +266,7 @@ export function apply(ctx, config) {
       return
     }
 
-    if (!config.includeSubagents && session.header?.origin === 'subagent') return
+    if (!current.includeSubagents && session.header?.origin === 'subagent') return
 
     if (event.type === 'turn/start') {
       running.add(session.id)
@@ -249,33 +282,33 @@ export function apply(ctx, config) {
 
       const kind = event.data.reason?.kind
       const name = label(session)
-      if (kind === 'completed' && config.onCompleted) {
+      if (kind === 'completed' && current.onCompleted) {
         // 秒级完成的轮次大概率正被盯着看，不打扰
-        if (durationSec < config.minDurationSec) return
-        enqueue('完成', '任务完成', name, config.sounds.completed, session)
-      } else if (kind === 'aborted' && config.onAborted) {
-        enqueue('中断', '任务已中断', name, config.sounds.aborted, session)
-      } else if (kind === 'blocked' && config.onError) {
-        enqueue('被阻止', '任务被阻止', name, config.sounds.error, session)
-      } else if (kind === 'error' && config.onError) {
+        if (durationSec < current.minDurationSec) return
+        enqueue('完成', '任务完成', name, current.sounds.completed, session)
+      } else if (kind === 'aborted' && current.onAborted) {
+        enqueue('中断', '任务已中断', name, current.sounds.aborted, session)
+      } else if (kind === 'blocked' && current.onError) {
+        enqueue('被阻止', '任务被阻止', name, current.sounds.error, session)
+      } else if (kind === 'error' && current.onError) {
         const err = event.data.reason?.error
         if (err?.code === 'RATE_LIMIT' || err?.status === 429) {
           const retry = err.providerRetryAfterMs
             ? `，服务商建议 ${Math.ceil(err.providerRetryAfterMs / 1000)} 秒后重试`
             : ''
-          enqueue('出错', 'API 限流', `${name}: 请求被限流（429）${retry}`, config.sounds.error, session)
+          enqueue('出错', 'API 限流', `${name}: 请求被限流（429）${retry}`, current.sounds.error, session)
         } else {
           const msg = err?.message ?? '未知错误'
-          enqueue('出错', '任务出错', `${name}: ${msg}`, config.sounds.error, session)
+          enqueue('出错', '任务出错', `${name}: ${msg}`, current.sounds.error, session)
         }
       }
       return
     }
 
-    if (event.type === 'approval/asked' && config.onApproval) {
+    if (event.type === 'approval/asked' && current.onApproval) {
       // 审批需要人处理，立即发，不合并
       const reason = event.data.reason ? ` — ${event.data.reason}` : ''
-      send('等待审批', `${label(session)}: ${event.data.toolName}${reason}`, config.sounds.approval)
+      send('等待审批', `${label(session)}: ${event.data.toolName}${reason}`, current.sounds.approval)
     }
   })
 
