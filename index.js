@@ -24,7 +24,9 @@ export const Config = Schema.object({
   digestMinutes: Schema.number().default(0),
   /** 子 agent 会话也通知（默认只通知顶层会话，避免刷屏） */
   includeSubagents: Schema.boolean().default(false),
-  /** 各事件类型的通知声音（macOS 声音名，空串为静音） */
+  /** 通知通道：auto = 支持的终端走 OSC 9，否则 osascript；osc9/osascript 强制指定 */
+  channel: Schema.union(['auto', 'osascript', 'osc9']).default('auto'),
+  /** 各事件类型的通知声音（macOS 声音名，空串为静音；OSC 9 通道下声音由终端决定，此配置无效） */
   sounds: Schema.object({
     completed: Schema.string().default('Glass'),
     error: Schema.string().default('Basso'),
@@ -41,12 +43,42 @@ function esc(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-function notify(title, body, sound) {
+function notify(title, body, sound, channel) {
+  if (channel === 'osc9') {
+    emitOsc9(title, body)
+    return
+  }
   const soundPart = sound ? ` sound name "${esc(sound)}"` : ''
   const script = `display notification "${esc(body)}" with title "${esc(title)}"${soundPart}`
   execFile('osascript', ['-e', script], (err) => {
     if (err) console.warn('[dsh-macos-notify] osascript failed:', err.message)
   })
+}
+
+// —— OSC 9 通道（思路参考 kimi-code 的 terminal-notification.ts）——
+
+/** 认识 OSC 9 桌面通知的终端白名单；不认识 OSC 9 的终端收到转义序列会打印乱码，所以必须保守 */
+function supportsOsc9(env = process.env) {
+  const termProgram = env.TERM_PROGRAM ?? ''
+  if (['iTerm.app', 'WezTerm', 'ghostty', 'WarpTerminal'].includes(termProgram)) return true
+  const term = env.TERM ?? ''
+  return term === 'xterm-kitty' || term === 'xterm-ghostty'
+}
+
+/** 剥掉控制字符，避免污染终端 */
+function sanitizeOsc9(s) {
+  return String(s).replace(/[\x00-\x1f\x7f]/g, ' ').trim()
+}
+
+function emitOsc9(title, body) {
+  const message = [title, body].map(sanitizeOsc9).filter(Boolean).join(': ').slice(0, 256)
+  if (!message) return
+  let seq = `\x1b]9;${message}\x07`
+  // tmux 会吞掉 OSC，需要 DCS passthrough 包裹并把载荷里的 ESC 双写
+  if (process.env.TMUX) {
+    seq = `\x1bPtmux;${seq.replaceAll('\x1b', '\x1b\x1b')}\x1b\\`
+  }
+  process.stdout.write(seq)
 }
 
 /** macOS 键鼠空闲秒数；读不到时返回 0（视为"人在电脑前"，即不抑制通知） */
@@ -71,6 +103,10 @@ export function apply(ctx, config) {
   let flushTimer = null
   // digest 通道：只攒「完成」
   let digestPending = []
+
+  // 通知通道：auto 在支持的终端里走 OSC 9（终端自己转系统通知），否则 osascript
+  const resolvedChannel = config.channel === 'auto' ? (supportsOsc9() ? 'osc9' : 'osascript') : config.channel
+  const send = (title, body, sound) => notify(title, body, sound, resolvedChannel)
 
   // 上报「正在看 dsh tab」的浏览器客户端：id -> 最近一次聚焦上报的时间戳
   const focusedClients = new Map()
@@ -148,7 +184,7 @@ export function apply(ctx, config) {
     if (items.length === 0) return
     void gateAndNotify(items, () => {
       const { title, body, sound } = render(items)
-      notify(title, body + runningSuffix(), sound)
+      send(title, body + runningSuffix(), sound)
     })
   }
 
@@ -159,7 +195,7 @@ export function apply(ctx, config) {
     void gateAndNotify(items, () => {
       const names = items.slice(0, 5).map((i) => i.label).join('、')
       const more = items.length > 5 ? ` 等 ${items.length} 个` : ''
-      notify(
+      send(
         `${items.length} 个任务完成`,
         `${names}${more}${runningSuffix()}`,
         config.sounds.completed,
@@ -179,7 +215,7 @@ export function apply(ctx, config) {
     }
     if (config.coalesceMs <= 0) {
       void gateAndNotify([{ kind, title, body, sound, label: label(session) }], () => {
-        notify(title, body + runningSuffix(), sound)
+        send(title, body + runningSuffix(), sound)
       })
       return
     }
@@ -188,7 +224,7 @@ export function apply(ctx, config) {
   }
 
   if (config.notifyOnLoad) {
-    notify('DSH', 'macOS 通知插件已加载', config.sounds.completed)
+    send('DSH', 'macOS 通知插件已加载', config.sounds.completed)
   }
 
   ctx.on('session/event', (session, event) => {
@@ -239,7 +275,7 @@ export function apply(ctx, config) {
     if (event.type === 'approval/asked' && config.onApproval) {
       // 审批需要人处理，立即发，不合并
       const reason = event.data.reason ? ` — ${event.data.reason}` : ''
-      notify('等待审批', `${label(session)}: ${event.data.toolName}${reason}`, config.sounds.approval)
+      send('等待审批', `${label(session)}: ${event.data.toolName}${reason}`, config.sounds.approval)
     }
   })
 
