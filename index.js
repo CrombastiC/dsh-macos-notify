@@ -132,14 +132,20 @@ export function apply(ctx, config) {
     return focusedClients.size > 0
   }
 
-  // 接收浏览器半的焦点上报与试听请求。connection 服务只在 web profile 存在，
+  // 接收浏览器半的焦点上报、试听与设置读写。connection 服务只在 web profile 存在，
   // 用 ctx.inject() 延迟挂载：headless 下回调永不触发（视为无人盯着，通知照发）
+  //
+  // 注意一：设置读写走自有 RPC 而不是 settings.describe/mutate 线面——
+  // dsh-host-apiproxy 对暴露给 Web 的设置命名空间有硬编码白名单
+  // （WEB_SETTINGS_NAMESPACES），第三方命名空间目前上不了那条线。
+  // 注意二：共享的 /api 通道只允许一个拦截器（已被 api-gateway 占用），
+  // 所以用 rpc.handle 注册独立通道 /macos-notify。
   ctx.inject(['connection'], (connCtx) => {
-    connCtx.connection.rpc.intercept(
-      '/api',
-      (endpoint) => endpoint === 'macos-notify/visibility' || endpoint === 'macos-notify/test',
+    try {
+      connCtx.connection.rpc.handle(
+      '/macos-notify',
       async (endpoint, payload) => {
-        if (endpoint === 'macos-notify/visibility') {
+        if (endpoint === 'visibility') {
           const { id, focused } = payload ?? {}
           if (typeof id === 'string') {
             if (focused) focusedClients.set(id, Date.now())
@@ -147,15 +153,36 @@ export function apply(ctx, config) {
           }
           return { ok: true, value: null }
         }
-        // macos-notify/test：设置页的「试听」按钮，立即发一条带对应提示音的测试通知
-        const kind = payload?.kind
-        if (SOUND_KINDS.includes(kind)) {
-          send('试听', `这是「${kind}」事件的提示音`, current.sounds[kind])
+        if (endpoint === 'test') {
+          // 设置页的「试听」按钮，立即发一条带对应提示音的测试通知
+          const kind = payload?.kind
+          if (SOUND_KINDS.includes(kind)) {
+            send('试听', `这是「${kind}」事件的提示音`, current.sounds[kind])
+          }
+          return { ok: true, value: null }
         }
-        return { ok: true, value: null }
+        if (endpoint === 'settings') {
+          // 设置卡片读写用户层：get 返回解析后的生效值，set 写入一个字段
+          const op = payload?.op
+          if (op === 'get') return { ok: true, value: scope.get() }
+          if (op === 'set' && typeof payload.field === 'string') {
+            try {
+              await scope.update({ [payload.field]: payload.value })
+              return { ok: true, value: null }
+            } catch (err) {
+              return { ok: false, error: { code: 'internal', message: String(err?.message ?? err), details: {} } }
+            }
+          }
+          return { ok: false, error: { code: 'internal', message: 'unknown settings op', details: {} } }
+        }
+        return { ok: false, error: { code: 'internal', message: 'unknown endpoint', details: {} } }
       },
       { authority: 'trusted-host' },
     )
+      console.log('[dsh-macos-notify] RPC intercept mounted')
+    } catch (err) {
+      console.error('[dsh-macos-notify] RPC intercept failed:', err)
+    }
   })
 
   const label = (session) =>

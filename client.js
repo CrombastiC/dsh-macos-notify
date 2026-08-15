@@ -1,6 +1,8 @@
 // dsh-macos-notify 的浏览器半：
 // 1. 跟踪 tab 焦点/可见性并上报给宿主插件（焦点抑制用）
 // 2. 在 设置 → 插件 → 可配置 里注册提示音卡片（settings.plugin.item slot）
+// 设置读写走自有 RPC（macos-notify/settings）：官方 settings.describe/mutate
+// 线面对命名空间有硬编码白名单，第三方插件暂时上不去。
 // 手写 bundle，零构建；格式即 dsh-client-modules 的 __ModuleLoader__ 包装。
 window.__ModuleLoader__.load({
   id: 'dsh-macos-notify',
@@ -29,48 +31,51 @@ window.__ModuleLoader__.load({
     }
 
     function SoundCard(props) {
-      var scope = props.scope
-      var snap = React.useSyncExternalStore(
-        scope.subscribe.bind(scope),
-        scope.getSnapshot.bind(scope),
-      )
-      var sounds = (snap.value && snap.value.sounds) || {}
       var draftsState = React.useState(null)
       var drafts = draftsState[0]
       var setDrafts = draftsState[1]
       var savedState = React.useState(false)
+      var saved = savedState[0]
       var setSaved = savedState[1]
+      var errorState = React.useState('')
+      var error = errorState[0]
+      var setError = errorState[1]
 
-      // 快照首次就绪时用当前值初始化草稿；之后草稿归用户，不被快照覆盖
       React.useEffect(() => {
-        if (snap.status === 'ready' && drafts === null) {
-          setDrafts(Object.assign({}, sounds))
-        }
-      }, [snap.status])
+        props.getSettings().then(function (value) {
+          if (value && value.sounds) setDrafts(Object.assign({}, value.sounds))
+          else setDrafts({})
+        }).catch(function () {
+          setDrafts({})
+          setError('设置读取失败')
+        })
+      }, [])
 
-      if (snap.status === 'loading' || drafts === null) {
+      if (drafts === null) {
         return h('div', { style: { padding: '12px', fontSize: '13px', opacity: 0.6 } }, '加载中…')
       }
 
       var dirty = SOUND_ROWS.some(function (row) {
-        return (drafts[row[0]] || '') !== (sounds[row[0]] || '')
+        return (drafts[row[0]] || '') !== (props.savedSounds[row[0]] || '')
       })
 
       var save = function () {
-        scope.set('sounds', {
+        var next = {
           completed: drafts.completed || '',
           error: drafts.error || '',
           aborted: drafts.aborted || '',
           approval: drafts.approval || '',
-        }).then(function () {
-          setSaved(true)
-          setTimeout(function () { setSaved(false) }, 2000)
+        }
+        props.saveSettings('sounds', next).then(function (ok) {
+          if (ok) {
+            setSaved(true)
+            setTimeout(function () { setSaved(false) }, 2000)
+          } else {
+            setError('保存失败')
+          }
         })
       }
-      var discard = function () { setDrafts(Object.assign({}, sounds)) }
-      var preview = function (kind) {
-        props.preview(kind)
-      }
+      var discard = function () { setDrafts(Object.assign({}, props.savedSounds)) }
 
       return h('div', {
         style: {
@@ -82,6 +87,7 @@ window.__ModuleLoader__.load({
         h('div', { style: { fontWeight: 600 } }, 'macOS 通知'),
         h('div', { style: { opacity: 0.6, fontSize: '12px' } },
           '各事件的提示音（macOS 系统声音名，如 Glass / Basso / Ping / Pop；留空为静音）。OSC 9 通道下声音由终端决定。'),
+        error ? h('div', { style: { color: '#e5534b', fontSize: '12px' } }, error) : null,
         SOUND_ROWS.map(function (row) {
           var kind = row[0]
           return h('div', {
@@ -101,7 +107,7 @@ window.__ModuleLoader__.load({
             }),
             h('button', {
               style: buttonStyle,
-              onClick: function () { preview(kind) },
+              onClick: function () { props.preview(kind) },
             }, '试听'),
           )
         }),
@@ -110,11 +116,38 @@ window.__ModuleLoader__.load({
             style: Object.assign({}, buttonStyle, { fontWeight: 600 }),
             disabled: !dirty,
             onClick: save,
-          }, savedState[0] ? '已保存 ✓' : '保存'),
+          }, saved ? '已保存 ✓' : '保存'),
           h('button', { style: buttonStyle, disabled: !dirty, onClick: discard }, '放弃修改'),
         ),
       )
     }
+
+    // 卡片外层的受控封装：持有「已保存的 sounds」，让脏检测有据可依
+    function SoundCardContainer(props) {
+      var savedState = React.useState({})
+      var savedSounds = savedState[0]
+      var setSavedSounds = savedState[1]
+      var getSettings = function () {
+        return props.call('settings', { op: 'get' }).then(function (value) {
+          if (value && value.sounds) setSavedSounds(Object.assign({}, value.sounds))
+          return value
+        })
+      }
+      var saveSettings = function (field, value) {
+        return props.call('settings', { op: 'set', field: field, value: value }).then(function () {
+          setSavedSounds(Object.assign({}, value))
+          return true
+        }).catch(function () { return false })
+      }
+      return h(SoundCard, {
+        getSettings: getSettings,
+        saveSettings: saveSettings,
+        savedSounds: savedSounds,
+        preview: props.preview,
+      })
+    }
+
+    exports.inject = ['connection', 'slots']
 
     exports.apply = function apply(ctx) {
       // —— 焦点上报 ——
@@ -122,7 +155,7 @@ window.__ModuleLoader__.load({
       var clientId = crypto.randomUUID()
       var report = function () {
         var focused = document.visibilityState === 'visible' && document.hasFocus()
-        ctx.connection.call('/api', 'macos-notify/visibility', {
+        ctx.connection.rpc.call('/macos-notify', 'visibility', {
           id: clientId,
           focused: focused,
         }).catch(function () {})
@@ -135,19 +168,26 @@ window.__ModuleLoader__.load({
       var timer = setInterval(report, 30000)
 
       // —— 设置卡片 ——
-      var scope = ctx.settingsScope.bind({ namespace: 'macos-notify' })
-      void scope.load()
-      ctx.slots.register({
-        name: 'settings.plugin.item',
-        id: 'macos-notify',
-        order: 100,
-        inject: () => ({
-          scope: scope,
-          preview: (kind) => {
-            ctx.connection.call('/api', 'macos-notify/test', { kind: kind }).catch(function () {})
-          },
-        }),
-      }, SoundCard)
+      var call = function (endpoint, payload) {
+        return ctx.connection.rpc.call('/macos-notify', endpoint, payload).then(function (result) {
+          if (!result || result.ok !== true) throw new Error((result && result.error && result.error.message) || 'rpc failed')
+          return result.value
+        })
+      }
+      // settings.plugin.item 由「可配置」标签页声明，必须用 slots.inject 挂进去
+      ctx.slots.inject('settings.plugin.item', function* () {
+        yield ctx.slots.register({
+          name: 'settings.plugin.item',
+          id: 'macos-notify',
+          order: 100,
+          inject: () => ({
+            call: call,
+            preview: (kind) => {
+              call('test', { kind: kind }).catch(function () {})
+            },
+          }),
+        }, SoundCardContainer)
+      })
 
       ctx.effect(function () {
         return function () {
