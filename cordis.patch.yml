@@ -1,0 +1,3 @@
+- insert:
+    - id: macos-notify
+      name: dsh-macos-notify

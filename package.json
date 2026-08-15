@@ -1,0 +1,26 @@
+{
+  "name": "dsh-macos-notify",
+  "version": "0.1.0",
+  "description": "macOS native notifications for DeepSeek Harness: turn end and approval prompts via Notification Center",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "client.js", "cordis.patch.yml"],
+  "keywords": ["dsh-plugin", "deepseek-harness", "macos", "notifications"],
+  "license": "MIT",
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-connection"]
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  }
+}
