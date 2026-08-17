@@ -1,7 +1,7 @@
 {
   "name": "dsh-macos-notify",
   "version": "0.1.0",
-  "description": "macOS native notifications for DeepSeek Harness: turn end and approval prompts via Notification Center",
+  "description": "Native macOS notifications and configurable sounds for DeepSeek Harness",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -11,7 +11,20 @@
   },
   "files": ["index.js", "client.js", "cordis.patch.yml"],
   "keywords": ["dsh-plugin", "deepseek-harness", "macos", "notifications"],
+  "author": "CrombastiC",
   "license": "MIT",
+  "homepage": "https://github.com/CrombastiC/dsh-macos-notify#readme",
+  "bugs": {
+    "url": "https://github.com/CrombastiC/dsh-macos-notify/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CrombastiC/dsh-macos-notify.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "os": ["darwin"],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {

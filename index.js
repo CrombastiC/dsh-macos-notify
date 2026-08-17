@@ -1,5 +1,9 @@
 import { execFile } from 'node:child_process'
-import { basename } from 'node:path'
+import { constants as fsConstants } from 'node:fs'
+import { chmod, copyFile, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
+import { basename, extname, join } from 'node:path'
+import { promisify } from 'node:util'
 import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'dsh-macos-notify'
@@ -41,6 +45,127 @@ export const Config = Schema.object({
 
 /** 设置页可编辑的提示音字段 */
 const SOUND_KINDS = ['completed', 'error', 'aborted', 'approval']
+const SOUND_EXTENSIONS = new Set(['.aif', '.aiff', '.caf', '.m4a', '.wav'])
+const IMPORT_EXTENSIONS = new Set([
+  '.aac', '.aif', '.aiff', '.caf', '.flac', '.m4a', '.mp3', '.oga', '.ogg', '.opus', '.wav',
+])
+const MAX_SOUND_BYTES = 5 * 1024 * 1024
+const MAX_SOUND_DURATION_SEC = 10
+const execFileAsync = promisify(execFile)
+
+function userSoundsDir() {
+  return join(homedir(), 'Library/Sounds')
+}
+
+function safeSoundName(filename) {
+  const extension = extname(filename).toLowerCase()
+  if (!IMPORT_EXTENSIONS.has(extension)) {
+    throw new Error('不支持该音频格式')
+  }
+  const name = basename(filename, extension)
+    .normalize('NFKC')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^\.+|\.+$/g, '')
+    .trim()
+    .slice(0, 80)
+  if (!name) throw new Error('声音文件名无效')
+  return { extension, name }
+}
+
+async function availableSoundPath(name) {
+  const dir = userSoundsDir()
+  await mkdir(dir, { recursive: true })
+  const existing = new Set((await readdir(dir)).map((item) => item.toLowerCase()))
+  for (let suffix = 0; suffix < 1000; suffix += 1) {
+    const candidateName = suffix === 0 ? name : `${name} (${suffix + 1})`
+    const filename = `${candidateName}.aiff`
+    if (!existing.has(filename.toLowerCase())) {
+      return { candidateName, path: join(dir, filename) }
+    }
+  }
+  throw new Error('同名声音文件过多')
+}
+
+async function convertToAiff(input, output) {
+  try {
+    await execFileAsync('/usr/bin/afconvert', ['-f', 'AIFF', '-d', 'BEI16@44100', input, output])
+  } catch (afconvertError) {
+    try {
+      await execFileAsync('ffmpeg', [
+        '-y', '-loglevel', 'error', '-i', input,
+        '-ar', '44100', '-ac', '1', '-c:a', 'pcm_s16be', output,
+      ])
+    } catch {
+      throw new Error(`音频转换失败：${afconvertError?.message ?? '格式无法识别'}`)
+    }
+  }
+}
+
+async function validateSoundDuration(path) {
+  const { stdout } = await execFileAsync('/usr/bin/afinfo', ['-r', path])
+  const match = stdout.match(/estimated duration:\s*([\d.]+)\s*sec/i)
+  const duration = match ? Number(match[1]) : NaN
+  if (!Number.isFinite(duration)) throw new Error('无法读取音频时长')
+  if (duration > MAX_SOUND_DURATION_SEC) {
+    throw new Error(`提示音时长不能超过 ${MAX_SOUND_DURATION_SEC} 秒`)
+  }
+}
+
+async function importSound(payload) {
+  if (typeof payload?.filename !== 'string' || typeof payload?.data !== 'string') {
+    throw new Error('缺少声音文件')
+  }
+  if (payload.data.length > Math.ceil(MAX_SOUND_BYTES * 4 / 3) + 8) {
+    throw new Error('声音文件不能超过 5MB')
+  }
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(payload.data)) {
+    throw new Error('声音文件内容无效')
+  }
+  const bytes = Buffer.from(payload.data, 'base64')
+  if (bytes.length === 0 || bytes.length > MAX_SOUND_BYTES) {
+    throw new Error('声音文件不能超过 5MB')
+  }
+
+  const { extension, name } = safeSoundName(payload.filename)
+  const tempDir = await mkdtemp(join(tmpdir(), 'dsh-macos-notify-'))
+  try {
+    const input = join(tempDir, `input${extension}`)
+    const output = join(tempDir, 'output.aiff')
+    await writeFile(input, bytes)
+    await convertToAiff(input, output)
+    await validateSoundDuration(output)
+    const destination = await availableSoundPath(name)
+    await copyFile(output, destination.path, fsConstants.COPYFILE_EXCL)
+    await chmod(destination.path, 0o644)
+    return destination.candidateName
+  } finally {
+    await rm(tempDir, { recursive: true, force: true })
+  }
+}
+
+/** macOS 系统与用户声音目录；读取失败的目录直接忽略 */
+async function systemSoundNames() {
+  const dirs = [
+    '/System/Library/Sounds',
+    '/Library/Sounds',
+    userSoundsDir(),
+  ]
+  const names = new Set()
+  await Promise.all(dirs.map(async (dir) => {
+    try {
+      const entries = await readdir(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry.isFile()) continue
+        const extension = extname(entry.name).toLowerCase()
+        if (SOUND_EXTENSIONS.has(extension)) names.add(basename(entry.name, extension))
+      }
+    } catch {
+      // 目录可能不存在或无读取权限；其余目录仍可用
+    }
+  }))
+  return [...names].sort((a, b) => a.localeCompare(b, 'en'))
+}
 
 function esc(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
@@ -157,9 +282,25 @@ export function apply(ctx, config) {
           // 设置页的「试听」按钮，立即发一条带对应提示音的测试通知
           const kind = payload?.kind
           if (SOUND_KINDS.includes(kind)) {
-            send('试听', `这是「${kind}」事件的提示音`, current.sounds[kind])
+            const sound = typeof payload?.sound === 'string' ? payload.sound : current.sounds[kind]
+            send('试听', `这是「${kind}」事件的提示音`, sound)
           }
           return { ok: true, value: null }
+        }
+        if (endpoint === 'sounds') {
+          return { ok: true, value: await systemSoundNames() }
+        }
+        if (endpoint === 'sound/import') {
+          try {
+            const imported = await importSound(payload)
+            return { ok: true, value: { name: imported } }
+          } catch (err) {
+            console.warn('[dsh-macos-notify] sound import failed:', err?.message ?? err)
+            return {
+              ok: false,
+              error: { code: 'internal', message: String(err?.message ?? err), details: {} },
+            }
+          }
         }
         if (endpoint === 'settings') {
           // 设置卡片读写用户层：get 返回解析后的生效值，set 写入一个字段
