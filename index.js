@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process'
 import { constants as fsConstants } from 'node:fs'
-import { chmod, copyFile, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { basename, extname, join } from 'node:path'
+import { basename, extname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import Schema from '@deepseek-ai/schemastery'
 
@@ -39,6 +39,20 @@ export const Config = Schema.object({
   }).default({ completed: 'Glass', error: 'Basso', aborted: '', approval: 'Ping' }),
   /** 轮次结束通知的合并窗口（毫秒）：窗口内多个会话的结束合并成一条，0 关闭合并 */
   coalesceMs: Schema.number().default(1500),
+  /** 是否启用每日勿扰时段 */
+  quietHoursEnabled: Schema.boolean().default(false),
+  /** 每日勿扰开始时间（本机时间，HH:mm） */
+  quietStart: Schema.string().default('23:00'),
+  /** 每日勿扰结束时间（本机时间，HH:mm） */
+  quietEnd: Schema.string().default('08:00'),
+  /** 勿扰时段仍允许错误、阻止和审批通知 */
+  quietAllowCritical: Schema.boolean().default(true),
+  /** 临时暂停截止时间（Unix 毫秒）；0 表示未暂停 */
+  pauseUntil: Schema.number().default(0),
+  /** 相同会话相同错误的重复抑制窗口（秒）；0 表示关闭 */
+  duplicateWindowSec: Schema.number().default(300),
+  /** 项目规则 JSON：[{ path, mode }]，mode 为 mute / errors / important */
+  projectRulesJson: Schema.string().default('[]'),
   /** 插件加载时发一条测试通知 */
   notifyOnLoad: Schema.boolean().default(true),
 })
@@ -51,10 +65,58 @@ const IMPORT_EXTENSIONS = new Set([
 ])
 const MAX_SOUND_BYTES = 5 * 1024 * 1024
 const MAX_SOUND_DURATION_SEC = 10
+const MAX_MANAGED_SOUND_COUNT = 20
+const MAX_MANAGED_SOUND_BYTES = 50 * 1024 * 1024
+const MAX_DIAGNOSTICS = 50
 const execFileAsync = promisify(execFile)
 
 function userSoundsDir() {
   return join(homedir(), 'Library/Sounds')
+}
+
+function soundRegistryPath() {
+  return join(homedir(), 'Library/Application Support/dsh-macos-notify/sounds.json')
+}
+
+async function readSoundRegistry() {
+  try {
+    const parsed = JSON.parse(await readFile(soundRegistryPath(), 'utf8'))
+    return Array.isArray(parsed) ? parsed.filter((item) =>
+      item && typeof item.name === 'string' && typeof item.filename === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+async function writeSoundRegistry(entries) {
+  const path = soundRegistryPath()
+  await mkdir(resolve(path, '..'), { recursive: true })
+  await writeFile(path, `${JSON.stringify(entries, null, 2)}\n`, { mode: 0o600 })
+}
+
+async function managedSoundCatalog() {
+  const dir = userSoundsDir()
+  const registry = await readSoundRegistry()
+  const catalog = []
+  const kept = []
+  for (const item of registry) {
+    const path = join(dir, item.filename)
+    try {
+      const info = await stat(path)
+      if (!info.isFile()) continue
+      kept.push(item)
+      catalog.push({
+        name: item.name,
+        filename: item.filename,
+        bytes: info.size,
+        importedAt: Number(item.importedAt) || info.birthtimeMs || info.mtimeMs,
+      })
+    } catch {
+      // 用户在 Finder 中删除了文件；下次写回时清理失效注册项。
+    }
+  }
+  if (kept.length !== registry.length) await writeSoundRegistry(kept)
+  return catalog.sort((a, b) => b.importedAt - a.importedAt)
 }
 
 function safeSoundName(filename) {
@@ -135,13 +197,52 @@ async function importSound(payload) {
     await writeFile(input, bytes)
     await convertToAiff(input, output)
     await validateSoundDuration(output)
+    const existing = await managedSoundCatalog()
+    const outputInfo = await stat(output)
+    const usedBytes = existing.reduce((total, item) => total + item.bytes, 0)
+    if (existing.length >= MAX_MANAGED_SOUND_COUNT) {
+      throw new Error(`最多管理 ${MAX_MANAGED_SOUND_COUNT} 个自定义提示音，请先删除不用的声音`)
+    }
+    if (usedBytes + outputInfo.size > MAX_MANAGED_SOUND_BYTES) {
+      throw new Error('自定义提示音总容量不能超过 50MB，请先删除不用的声音')
+    }
     const destination = await availableSoundPath(name)
     await copyFile(output, destination.path, fsConstants.COPYFILE_EXCL)
     await chmod(destination.path, 0o644)
+    try {
+      const registry = await readSoundRegistry()
+      registry.push({
+        name: destination.candidateName,
+        filename: basename(destination.path),
+        importedAt: Date.now(),
+      })
+      await writeSoundRegistry(registry)
+    } catch (err) {
+      await rm(destination.path, { force: true })
+      throw err
+    }
     return destination.candidateName
   } finally {
     await rm(tempDir, { recursive: true, force: true })
   }
+}
+
+async function deleteManagedSound(name) {
+  const registry = await readSoundRegistry()
+  const index = registry.findIndex((item) => item.name === name)
+  if (index < 0) throw new Error('只能删除由本插件导入并管理的声音')
+  const [entry] = registry.splice(index, 1)
+  const target = resolve(userSoundsDir(), entry.filename)
+  const root = `${resolve(userSoundsDir())}/`
+  if (!target.startsWith(root) || basename(target) !== entry.filename) {
+    throw new Error('声音文件路径无效')
+  }
+  try {
+    await unlink(target)
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err
+  }
+  await writeSoundRegistry(registry)
 }
 
 /** macOS 系统与用户声音目录；读取失败的目录直接忽略 */
@@ -167,19 +268,30 @@ async function systemSoundNames() {
   return [...names].sort((a, b) => a.localeCompare(b, 'en'))
 }
 
+async function soundCatalog() {
+  const [names, managed] = await Promise.all([systemSoundNames(), managedSoundCatalog()])
+  return {
+    names,
+    managed,
+    limits: { count: MAX_MANAGED_SOUND_COUNT, bytes: MAX_MANAGED_SOUND_BYTES },
+  }
+}
+
 function esc(s) {
   return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-function notify(title, body, sound, channel) {
+function notify(title, body, sound, channel, onResult = () => {}) {
   if (channel === 'osc9') {
     emitOsc9(title, body)
+    onResult(null)
     return
   }
   const soundPart = sound ? ` sound name "${esc(sound)}"` : ''
   const script = `display notification "${esc(body)}" with title "${esc(title)}"${soundPart}`
   execFile('osascript', ['-e', script], (err) => {
     if (err) console.warn('[dsh-macos-notify] osascript failed:', err.message)
+    onResult(err ?? null)
   })
 }
 
@@ -219,6 +331,53 @@ function idleSeconds() {
   })
 }
 
+function minuteOfDay(value) {
+  const match = /^(\d{2}):(\d{2})$/.exec(String(value))
+  if (!match) return null
+  const hour = Number(match[1])
+  const minute = Number(match[2])
+  if (hour > 23 || minute > 59) return null
+  return hour * 60 + minute
+}
+
+function quietHoursActive(config, now = new Date()) {
+  if (!config.quietHoursEnabled) return false
+  const start = minuteOfDay(config.quietStart)
+  const end = minuteOfDay(config.quietEnd)
+  if (start === null || end === null || start === end) return false
+  const currentMinute = now.getHours() * 60 + now.getMinutes()
+  return start < end
+    ? currentMinute >= start && currentMinute < end
+    : currentMinute >= start || currentMinute < end
+}
+
+function parseProjectRules(raw) {
+  try {
+    const value = JSON.parse(raw)
+    if (!Array.isArray(value)) return []
+    return value.slice(0, 50).flatMap((item) => {
+      const path = typeof item?.path === 'string' ? item.path.trim() : ''
+      const mode = item?.mode
+      if (!path || !['mute', 'errors', 'important'].includes(mode)) return []
+      return [{ path: resolve(path), mode }]
+    })
+  } catch {
+    return []
+  }
+}
+
+function matchingProjectRule(rules, cwd) {
+  if (!cwd) return null
+  const target = resolve(cwd)
+  return rules
+    .filter((rule) => target === rule.path || target.startsWith(`${rule.path}/`))
+    .sort((a, b) => b.path.length - a.path.length)[0] ?? null
+}
+
+function isCriticalKind(kind) {
+  return kind === '出错' || kind === '被阻止' || kind === '审批'
+}
+
 export function apply(ctx, config) {
   // 配置三层叠加：schema 默认值 < cordis 组合层（base = 插件 config）< 用户层（设置页）。
   // 设置页写入后经 watch 实时生效，不需要重启。
@@ -237,13 +396,49 @@ export function apply(ctx, config) {
   // digest 通道：只攒「完成」
   let digestPending = []
   let digestTimer = null
+  // 最近的通知决策，仅保存在当前进程内；设置页用于解释“为什么没弹”。
+  let diagnostics = []
+  let diagnosticSeq = 0
+  // 重复错误键 -> 首次发送时间、被抑制次数
+  const duplicates = new Map()
+  let projectRules = parseProjectRules(current.projectRulesJson)
+
+  const record = (status, item, detail, extra = {}) => {
+    diagnostics.unshift({
+      id: ++diagnosticSeq,
+      time: Date.now(),
+      status,
+      kind: item?.kind ?? '系统',
+      title: item?.title ?? '',
+      label: item?.label ?? '',
+      sessionId: item?.sessionId ?? null,
+      cwd: item?.cwd ?? null,
+      detail,
+      channel: resolvedChannel,
+      ...extra,
+    })
+    if (diagnostics.length > MAX_DIAGNOSTICS) diagnostics.length = MAX_DIAGNOSTICS
+  }
 
   // 通知通道：auto 在支持的终端里走 OSC 9（终端自己转系统通知），否则 osascript
   let resolvedChannel = resolveChannel()
   function resolveChannel() {
     return current.channel === 'auto' ? (supportsOsc9() ? 'osc9' : 'osascript') : current.channel
   }
-  const send = (title, body, sound) => notify(title, body, sound, resolvedChannel)
+  const send = (title, body, sound, items = [], options = {}) => {
+    const representative = items[0] ?? { kind: options.kind ?? '系统', title, label: body }
+    notify(title, body, sound, resolvedChannel, (err) => {
+      if (err) {
+        for (const item of items.length ? items : [representative]) {
+          record('error', item, `发送失败：${err.message}`)
+        }
+        return
+      }
+      for (const item of items.length ? items : [representative]) {
+        record('sent', item, options.detail ?? `已通过 ${resolvedChannel} 发送`)
+      }
+    })
+  }
 
   // 上报「正在看 dsh tab」的浏览器客户端：id -> 最近一次聚焦上报的时间戳
   const focusedClients = new Map()
@@ -279,16 +474,32 @@ export function apply(ctx, config) {
           return { ok: true, value: null }
         }
         if (endpoint === 'test') {
-          // 设置页的「试听」按钮，立即发一条带对应提示音的测试通知
+          // 测试矩阵绕过勿扰和过滤规则，确保能直接验证系统投递通道。
           const kind = payload?.kind
           if (SOUND_KINDS.includes(kind)) {
             const sound = typeof payload?.sound === 'string' ? payload.sound : current.sounds[kind]
-            send('试听', `这是「${kind}」事件的提示音`, sound)
+            const labels = {
+              completed: ['完成测试', '模拟任务已完成'],
+              error: ['错误测试', '模拟任务发生错误'],
+              aborted: ['中断测试', '模拟任务已中断'],
+              approval: ['审批测试', '模拟工具正在等待审批'],
+            }
+            const item = { kind: kind === 'approval' ? '审批' : `测试/${kind}`, title: labels[kind][0], label: labels[kind][1] }
+            send(labels[kind][0], labels[kind][1], sound, [item], { detail: '设置页测试通知' })
+          } else if (kind === 'coalesced') {
+            const items = [
+              { kind: '完成', title: '合并测试', label: '示例任务 A' },
+              { kind: '完成', title: '合并测试', label: '示例任务 B' },
+            ]
+            send('2 个任务有结果', '2 个完成：示例任务 A、示例任务 B', current.sounds.completed, items, { detail: '设置页合并通知测试' })
+          } else if (kind === 'digest') {
+            const item = { kind: '完成', title: '摘要测试', label: '3 个示例任务' }
+            send('3 个任务完成', '示例任务 A、示例任务 B、示例任务 C', current.sounds.completed, [item], { detail: '设置页摘要通知测试' })
           }
           return { ok: true, value: null }
         }
         if (endpoint === 'sounds') {
-          return { ok: true, value: await systemSoundNames() }
+          return { ok: true, value: await soundCatalog() }
         }
         if (endpoint === 'sound/import') {
           try {
@@ -302,6 +513,44 @@ export function apply(ctx, config) {
             }
           }
         }
+        if (endpoint === 'sound/delete') {
+          try {
+            const soundName = typeof payload?.name === 'string' ? payload.name : ''
+            const inUse = SOUND_KINDS.filter((kind) => current.sounds[kind] === soundName)
+            if (inUse.length && payload?.force !== true) {
+              return { ok: true, value: { requiresConfirmation: true, inUse } }
+            }
+            await deleteManagedSound(soundName)
+            if (inUse.length) {
+              const sounds = { ...current.sounds }
+              for (const kind of inUse) sounds[kind] = ''
+              await scope.update({ sounds })
+            }
+            return { ok: true, value: { deleted: true, catalog: await soundCatalog() } }
+          } catch (err) {
+            return { ok: false, error: { code: 'internal', message: String(err?.message ?? err), details: {} } }
+          }
+        }
+        if (endpoint === 'diagnostics') {
+          const op = payload?.op ?? 'get'
+          if (op === 'clear') diagnostics = []
+          anyFocused()
+          return {
+            ok: true,
+            value: {
+              entries: diagnostics,
+              status: {
+                channel: resolvedChannel,
+                configuredChannel: current.channel,
+                focusedTabs: focusedClients.size,
+                quietActive: quietHoursActive(current),
+                pauseUntil: current.pauseUntil,
+                pending: pending.length,
+                digestPending: digestPending.length,
+              },
+            },
+          }
+        }
         if (endpoint === 'settings') {
           // 设置卡片读写用户层：get 返回解析后的生效值，set 写入一个字段
           const op = payload?.op
@@ -310,6 +559,31 @@ export function apply(ctx, config) {
             try {
               await scope.update({ [payload.field]: payload.value })
               return { ok: true, value: null }
+            } catch (err) {
+              return { ok: false, error: { code: 'internal', message: String(err?.message ?? err), details: {} } }
+            }
+          }
+          if (op === 'patch' && payload.value && typeof payload.value === 'object' && !Array.isArray(payload.value)) {
+            try {
+              const editable = new Set([
+                'onCompleted', 'onError', 'onAborted', 'onApproval', 'minDurationSec',
+                'onlyWhenIdleSec', 'onlyWhenUnfocused', 'digestMinutes', 'includeSubagents',
+                'channel', 'sounds', 'coalesceMs', 'quietHoursEnabled', 'quietStart', 'quietEnd',
+                'quietAllowCritical', 'pauseUntil', 'duplicateWindowSec', 'projectRulesJson',
+              ])
+              if (Object.keys(payload.value).some((key) => !editable.has(key))) throw new Error('包含不可编辑的设置字段')
+              for (const field of ['quietStart', 'quietEnd']) {
+                if (field in payload.value && minuteOfDay(payload.value[field]) === null) throw new Error('勿扰时间格式无效')
+              }
+              if (typeof payload.value.projectRulesJson === 'string') {
+                const parsed = JSON.parse(payload.value.projectRulesJson)
+                if (!Array.isArray(parsed) || parsed.length > 50) throw new Error('项目规则格式无效')
+                if (parsed.some((rule) => typeof rule?.path !== 'string' || !['mute', 'errors', 'important'].includes(rule?.mode))) {
+                  throw new Error('项目规则格式无效')
+                }
+              }
+              await scope.update(payload.value)
+              return { ok: true, value: scope.get() }
             } catch (err) {
               return { ok: false, error: { code: 'internal', message: String(err?.message ?? err), details: {} } }
             }
@@ -335,16 +609,87 @@ export function apply(ctx, config) {
     return n > 0 ? `（还有 ${n} 个任务进行中）` : ''
   }
 
-  // 「完成」类（纯 completed 的一批）过两道闸：焦点抑制 + 键鼠空闲抑制
+  const makeItem = (kind, title, body, sound, session) => ({
+    kind,
+    title,
+    body,
+    sound,
+    label: label(session),
+    sessionId: session?.id ?? null,
+    cwd: session?.header?.cwd ?? null,
+    important: false,
+  })
+
+  const applyProjectRule = (item) => {
+    const rule = matchingProjectRule(projectRules, item.cwd)
+    if (!rule) return true
+    if (rule.mode === 'mute') {
+      record('suppressed', item, `项目规则已静音：${rule.path}`)
+      return false
+    }
+    if (rule.mode === 'errors' && !isCriticalKind(item.kind)) {
+      record('suppressed', item, `项目规则仅允许错误和审批：${rule.path}`)
+      return false
+    }
+    if (rule.mode === 'important') item.important = true
+    return true
+  }
+
+  const applyTimePolicy = (item) => {
+    if (item.important) return true
+    if (current.pauseUntil > Date.now()) {
+      record('suppressed', item, `通知已暂停至 ${new Date(current.pauseUntil).toLocaleString()}`)
+      return false
+    }
+    if (quietHoursActive(current) && !(current.quietAllowCritical && isCriticalKind(item.kind))) {
+      record('suppressed', item, `当前处于勿扰时段 ${current.quietStart}–${current.quietEnd}`)
+      return false
+    }
+    return true
+  }
+
+  const applyDuplicatePolicy = (item) => {
+    if (!['出错', '被阻止'].includes(item.kind) || current.duplicateWindowSec <= 0) return true
+    const now = Date.now()
+    const key = `${item.sessionId ?? ''}\u0000${item.kind}\u0000${item.body}`
+    const previous = duplicates.get(key)
+    const windowMs = current.duplicateWindowSec * 1000
+    if (previous && now - previous.at < windowMs) {
+      previous.count += 1
+      record('suppressed', item, `重复通知已合并（本窗口第 ${previous.count} 次）`)
+      return false
+    }
+    if (previous?.count) item.body += `（此前重复 ${previous.count} 次）`
+    duplicates.set(key, { at: now, count: 0 })
+    for (const [candidate, value] of duplicates) {
+      if (now - value.at > Math.max(windowMs * 2, 60_000)) duplicates.delete(candidate)
+    }
+    return true
+  }
+
+  // 发送前再检查实时策略；摘要可能在进入队列后才跨入勿扰时段。
   const gateAndNotify = async (items, sendBatch) => {
-    if (items.every((i) => i.kind === '完成')) {
-      if (current.onlyWhenUnfocused && anyFocused()) return
-      if (current.onlyWhenIdleSec > 0) {
-        const idle = await idleSeconds()
-        if (idle < current.onlyWhenIdleSec) return
+    let allowed = items.filter(applyTimePolicy)
+    if (allowed.length === 0) return
+    if (current.onlyWhenUnfocused && anyFocused()) {
+      allowed = allowed.filter((item) => {
+        if (item.kind !== '完成' || item.important) return true
+        record('suppressed', item, 'DSH Web 页面当前处于聚焦状态')
+        return false
+      })
+    }
+    const idleCandidates = allowed.filter((item) => item.kind === '完成' && !item.important)
+    if (current.onlyWhenIdleSec > 0 && idleCandidates.length) {
+      const idle = await idleSeconds()
+      if (idle < current.onlyWhenIdleSec) {
+        allowed = allowed.filter((item) => {
+          if (item.kind !== '完成' || item.important) return true
+          record('suppressed', item, `键鼠仅空闲 ${Math.floor(idle)} 秒，要求 ${current.onlyWhenIdleSec} 秒`)
+          return false
+        })
       }
     }
-    sendBatch()
+    if (allowed.length) sendBatch(allowed)
   }
 
   const render = (items) => {
@@ -370,9 +715,9 @@ export function apply(ctx, config) {
     const items = pending
     pending = []
     if (items.length === 0) return
-    void gateAndNotify(items, () => {
-      const { title, body, sound } = render(items)
-      send(title, body + runningSuffix(), sound)
+    void gateAndNotify(items, (allowed) => {
+      const { title, body, sound } = render(allowed)
+      send(title, body + runningSuffix(), sound, allowed)
     })
   }
 
@@ -380,13 +725,14 @@ export function apply(ctx, config) {
     const items = digestPending
     digestPending = []
     if (items.length === 0) return
-    void gateAndNotify(items, () => {
-      const names = items.slice(0, 5).map((i) => i.label).join('、')
-      const more = items.length > 5 ? ` 等 ${items.length} 个` : ''
+    void gateAndNotify(items, (allowed) => {
+      const names = allowed.slice(0, 5).map((i) => i.label).join('、')
+      const more = allowed.length > 5 ? ` 等 ${allowed.length} 个` : ''
       send(
-        `${items.length} 个任务完成`,
+        `${allowed.length} 个任务完成`,
         `${names}${more}${runningSuffix()}`,
         current.sounds.completed,
+        allowed,
       )
     })
   }
@@ -406,26 +752,36 @@ export function apply(ctx, config) {
   scope.watch((next) => {
     current = next
     resolvedChannel = resolveChannel()
+    projectRules = parseProjectRules(current.projectRulesJson)
     setupDigest()
   })
 
-  const enqueue = (kind, title, body, sound, session) => {
+  const enqueue = (kind, title, body, sound, session, options = {}) => {
+    const item = makeItem(kind, title, body, sound, session)
+    if (!applyProjectRule(item)) return
+    if (kind === '完成' && options.durationSec < current.minDurationSec && !item.important) {
+      record('suppressed', item, `任务耗时 ${options.durationSec.toFixed(1)} 秒，短于 ${current.minDurationSec} 秒`)
+      return
+    }
+    if (!applyDuplicatePolicy(item)) return
     if (kind === '完成' && current.digestMinutes > 0) {
-      digestPending.push({ kind, title, body, sound, label: label(session) })
+      digestPending.push(item)
+      record('queued', item, `已进入 ${current.digestMinutes} 分钟摘要队列`)
       return
     }
     if (current.coalesceMs <= 0) {
-      void gateAndNotify([{ kind, title, body, sound, label: label(session) }], () => {
-        send(title, body + runningSuffix(), sound)
+      void gateAndNotify([item], (allowed) => {
+        send(title, body + runningSuffix(), sound, allowed)
       })
       return
     }
-    pending.push({ kind, title, body, sound, label: label(session) })
+    pending.push(item)
+    record('queued', item, `等待 ${current.coalesceMs} 毫秒合并窗口`)
     if (!flushTimer) flushTimer = setTimeout(flush, current.coalesceMs)
   }
 
   if (current.notifyOnLoad) {
-    send('DSH', 'macOS 通知插件已加载', current.sounds.completed)
+    send('DSH', 'macOS 通知插件已加载', current.sounds.completed, [], { detail: '插件加载测试通知' })
   }
 
   ctx.on('session/event', (session, event) => {
@@ -434,7 +790,12 @@ export function apply(ctx, config) {
       return
     }
 
-    if (!current.includeSubagents && session.header?.origin === 'subagent') return
+    if (!current.includeSubagents && session.header?.origin === 'subagent') {
+      if (event.type === 'turn/end' || event.type === 'approval/asked') {
+        record('suppressed', makeItem('子 Agent', '通知已过滤', label(session), '', session), '配置已排除子 Agent 会话')
+      }
+      return
+    }
 
     if (event.type === 'turn/start') {
       running.add(session.id)
@@ -450,14 +811,15 @@ export function apply(ctx, config) {
 
       const kind = event.data.reason?.kind
       const name = label(session)
-      if (kind === 'completed' && current.onCompleted) {
-        // 秒级完成的轮次大概率正被盯着看，不打扰
-        if (durationSec < current.minDurationSec) return
-        enqueue('完成', '任务完成', name, current.sounds.completed, session)
-      } else if (kind === 'aborted' && current.onAborted) {
-        enqueue('中断', '任务已中断', name, current.sounds.aborted, session)
-      } else if (kind === 'blocked' && current.onError) {
-        enqueue('被阻止', '任务被阻止', name, current.sounds.error, session)
+      if (kind === 'completed') {
+        if (current.onCompleted) enqueue('完成', '任务完成', name, current.sounds.completed, session, { durationSec })
+        else record('suppressed', makeItem('完成', '任务完成', name, current.sounds.completed, session), '完成通知已关闭')
+      } else if (kind === 'aborted') {
+        if (current.onAborted) enqueue('中断', '任务已中断', name, current.sounds.aborted, session)
+        else record('suppressed', makeItem('中断', '任务已中断', name, current.sounds.aborted, session), '中断通知已关闭')
+      } else if (kind === 'blocked') {
+        if (current.onError) enqueue('被阻止', '任务被阻止', name, current.sounds.error, session)
+        else record('suppressed', makeItem('被阻止', '任务被阻止', name, current.sounds.error, session), '错误通知已关闭')
       } else if (kind === 'error' && current.onError) {
         const err = event.data.reason?.error
         if (err?.code === 'RATE_LIMIT' || err?.status === 429) {
@@ -469,6 +831,8 @@ export function apply(ctx, config) {
           const msg = err?.message ?? '未知错误'
           enqueue('出错', '任务出错', `${name}: ${msg}`, current.sounds.error, session)
         }
+      } else if (kind === 'error') {
+        record('suppressed', makeItem('出错', '任务出错', name, current.sounds.error, session), '错误通知已关闭')
       }
       return
     }
@@ -476,7 +840,13 @@ export function apply(ctx, config) {
     if (event.type === 'approval/asked' && current.onApproval) {
       // 审批需要人处理，立即发，不合并
       const reason = event.data.reason ? ` — ${event.data.reason}` : ''
-      send('等待审批', `${label(session)}: ${event.data.toolName}${reason}`, current.sounds.approval)
+      const body = `${label(session)}: ${event.data.toolName}${reason}`
+      const item = makeItem('审批', '等待审批', body, current.sounds.approval, session)
+      if (applyProjectRule(item)) {
+        void gateAndNotify([item], (allowed) => send('等待审批', body, current.sounds.approval, allowed))
+      }
+    } else if (event.type === 'approval/asked') {
+      record('suppressed', makeItem('审批', '等待审批', label(session), current.sounds.approval, session), '审批通知已关闭')
     }
   })
 

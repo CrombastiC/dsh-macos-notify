@@ -1,9 +1,4 @@
-// dsh-macos-notify 的浏览器半：
-// 1. 跟踪 tab 焦点/可见性并上报给宿主插件（焦点抑制用）
-// 2. 在 设置 → 插件 → 可配置 里注册提示音卡片（settings.plugin.item slot）
-// 设置读写走自有 RPC（macos-notify/settings）：官方 settings.describe/mutate
-// 线面对命名空间有硬编码白名单，第三方插件暂时上不去。
-// 手写 bundle，零构建；格式即 dsh-client-modules 的 __ModuleLoader__ 包装。
+// dsh-macos-notify Web UI: focus reporting, settings, sound management and diagnostics.
 window.__ModuleLoader__.load({
   id: 'dsh-macos-notify',
   factory: (require) => {
@@ -13,382 +8,197 @@ window.__ModuleLoader__.load({
     var h = React.createElement
 
     var SOUND_ROWS = [
-      ['completed', '任务完成'],
-      ['error', '出错 / 被阻止 / 限流'],
-      ['aborted', '任务中断'],
-      ['approval', '等待审批'],
+      ['completed', '任务完成'], ['error', '出错 / 被阻止'],
+      ['aborted', '任务中断'], ['approval', '等待审批'],
     ]
-    var FALLBACK_SOUND_NAMES = [
-      'Basso', 'Blow', 'Bottle', 'Frog', 'Funk', 'Glass', 'Hero',
-      'Morse', 'Ping', 'Pop', 'Purr', 'Sosumi', 'Submarine', 'Tink',
-    ]
-
-    var inputStyle = {
-      width: '140px', padding: '4px 8px', fontSize: '13px',
-      border: '1px solid var(--dsw-alias-border-l2, #444)',
-      borderRadius: '6px', background: 'transparent', color: 'inherit',
-    }
-    var buttonStyle = {
-      padding: '4px 10px', fontSize: '12px', cursor: 'pointer', minHeight: '28px',
-      border: '1px solid var(--dsw-alias-border-l2, #444)',
-      borderRadius: '6px', background: 'transparent', color: 'inherit',
-      transition: 'background-color 160ms ease, border-color 160ms ease, color 160ms ease, transform 120ms ease',
-    }
-
-    var feedbackCss = [
-      '@keyframes dshNotifyCardSaved { 0% { box-shadow: 0 0 0 0 rgba(46, 157, 98, .28); border-color: rgba(46, 157, 98, .65); } 100% { box-shadow: 0 0 0 5px rgba(46, 157, 98, 0); } }',
-      '@keyframes dshNotifyWave { 0%, 100% { transform: scaleY(.35); opacity: .55; } 50% { transform: scaleY(1); opacity: 1; } }',
-      '@keyframes dshNotifyErrorShake { 0%, 100% { transform: translateX(0); } 30% { transform: translateX(-3px); } 70% { transform: translateX(3px); } }',
-      '.dsh-notify-card-saved { animation: dshNotifyCardSaved 650ms ease-out both; }',
-      '.dsh-notify-error { animation: dshNotifyErrorShake 240ms ease-out both; }',
-      '.dsh-notify-wave { display: inline-flex; align-items: center; gap: 2px; height: 12px; }',
-      '.dsh-notify-wave > i { width: 2px; height: 10px; border-radius: 2px; background: currentColor; transform-origin: center; animation: dshNotifyWave 620ms ease-in-out infinite; }',
-      '.dsh-notify-wave > i:nth-child(2) { animation-delay: 110ms; }',
-      '.dsh-notify-wave > i:nth-child(3) { animation-delay: 220ms; }',
-      '@media (prefers-reduced-motion: reduce) { .dsh-notify-card-saved, .dsh-notify-error, .dsh-notify-wave > i { animation: none !important; } }',
+    var FALLBACK_SOUNDS = ['Basso', 'Blow', 'Bottle', 'Frog', 'Funk', 'Glass', 'Hero', 'Morse', 'Ping', 'Pop', 'Purr', 'Sosumi', 'Submarine', 'Tink']
+    var RULE_LABELS = { mute: '全部静音', errors: '仅错误与审批', important: '重要项目（忽略过滤）' }
+    var KIND_LABELS = { completed: '完成', error: '错误', aborted: '中断', approval: '审批' }
+    var inputStyle = { width: '150px', padding: '5px 8px', fontSize: '12px', boxSizing: 'border-box', border: '1px solid var(--dsw-alias-border-l2,#444)', borderRadius: '6px', background: 'transparent', color: 'inherit' }
+    var buttonStyle = { padding: '5px 10px', minHeight: '29px', fontSize: '12px', cursor: 'pointer', border: '1px solid var(--dsw-alias-border-l2,#444)', borderRadius: '6px', background: 'transparent', color: 'inherit' }
+    var sectionStyle = { borderTop: '1px solid var(--dsw-alias-border-l2,#444)', paddingTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }
+    var rowStyle = { display: 'flex', alignItems: 'center', gap: '9px', minHeight: '30px' }
+    var css = [
+      '@keyframes dshSaved{0%{box-shadow:0 0 0 0 rgba(46,157,98,.3);border-color:rgba(46,157,98,.7)}100%{box-shadow:0 0 0 5px rgba(46,157,98,0)}}',
+      '@keyframes dshShake{0%,100%{transform:translateX(0)}30%{transform:translateX(-3px)}70%{transform:translateX(3px)}}',
+      '.dsh-notify-saved{animation:dshSaved 650ms ease-out both}.dsh-notify-error{animation:dshShake 240ms ease-out both}',
+      '@media(prefers-reduced-motion:reduce){.dsh-notify-saved,.dsh-notify-error{animation:none!important}}',
     ].join('\n')
 
-    function SoundCard(props) {
-      var draftsState = React.useState(null)
-      var drafts = draftsState[0]
-      var setDrafts = draftsState[1]
-      var soundNamesState = React.useState([])
-      var soundNames = soundNamesState[0]
-      var setSoundNames = soundNamesState[1]
-      var editingState = React.useState(false)
-      var editing = editingState[0]
-      var setEditing = editingState[1]
-      var savedState = React.useState(false)
-      var saved = savedState[0]
-      var setSaved = savedState[1]
-      var savingState = React.useState(false)
-      var saving = savingState[0]
-      var setSaving = savingState[1]
-      var importingState = React.useState(false)
-      var importing = importingState[0]
-      var setImporting = importingState[1]
-      var importedNameState = React.useState('')
-      var importedName = importedNameState[0]
-      var setImportedName = importedNameState[1]
-      var previewingState = React.useState('')
-      var previewing = previewingState[0]
-      var setPreviewing = previewingState[1]
-      var errorState = React.useState('')
-      var error = errorState[0]
-      var setError = errorState[1]
-      var savedTimer = React.useRef(null)
-      var previewTimer = React.useRef(null)
-      var fileInput = React.useRef(null)
+    function parseRules(raw) {
+      try {
+        var value = JSON.parse(raw || '[]')
+        return Array.isArray(value) ? value.map(function (rule) { return { path: String(rule.path || ''), mode: String(rule.mode || 'mute') } }) : []
+      } catch { return [] }
+    }
+    function toDraft(settings) {
+      return Object.assign({}, settings, { sounds: Object.assign({}, settings.sounds || {}), projectRules: parseRules(settings.projectRulesJson) })
+    }
+    function toPatch(draft) {
+      return {
+        onCompleted: !!draft.onCompleted, onError: !!draft.onError, onAborted: !!draft.onAborted, onApproval: !!draft.onApproval,
+        minDurationSec: Math.max(0, Number(draft.minDurationSec) || 0), onlyWhenIdleSec: Math.max(0, Number(draft.onlyWhenIdleSec) || 0),
+        onlyWhenUnfocused: !!draft.onlyWhenUnfocused, digestMinutes: Math.max(0, Number(draft.digestMinutes) || 0),
+        includeSubagents: !!draft.includeSubagents, channel: draft.channel || 'auto', sounds: Object.assign({}, draft.sounds),
+        coalesceMs: Math.max(0, Number(draft.coalesceMs) || 0), quietHoursEnabled: !!draft.quietHoursEnabled,
+        quietStart: draft.quietStart || '23:00', quietEnd: draft.quietEnd || '08:00', quietAllowCritical: !!draft.quietAllowCritical,
+        pauseUntil: Number(draft.pauseUntil) || 0, duplicateWindowSec: Math.max(0, Number(draft.duplicateWindowSec) || 0),
+        projectRulesJson: JSON.stringify((draft.projectRules || []).filter(function (rule) { return rule.path.trim() }).map(function (rule) { return { path: rule.path.trim(), mode: rule.mode } })),
+      }
+    }
+    function SectionTitle(props) {
+      return h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: '8px' } },
+        h('strong', null, props.title), props.note ? h('span', { style: { opacity: .55, fontSize: '11px', textAlign: 'right' } }, props.note) : null)
+    }
+    function Toggle(props) {
+      return h('label', { style: rowStyle }, h('input', { type: 'checkbox', checked: !!props.value, disabled: props.disabled, onChange: function (e) { props.onChange(e.target.checked) } }), h('span', { style: { flex: 1 } }, props.label))
+    }
+    function SettingRow(props) {
+      return h('label', { style: rowStyle }, h('span', { style: { flex: 1 } }, props.label, props.note ? h('small', { style: { display: 'block', opacity: .5 } }, props.note) : null), props.children)
+    }
 
-      React.useEffect(() => {
-        props.getSettings().then(function (value) {
-          if (value && value.sounds) setDrafts(Object.assign({}, value.sounds))
-          else setDrafts({})
-        }).catch(function () {
-          setDrafts({})
-          setError('设置读取失败')
-        })
-        props.listSounds().then(function (names) {
-          if (Array.isArray(names) && names.length) setSoundNames(names)
-        }).catch(function () {})
-        return function () {
-          if (savedTimer.current) clearTimeout(savedTimer.current)
-          if (previewTimer.current) clearTimeout(previewTimer.current)
-        }
+    function Card(props) {
+      var settingsState = React.useState(null), settings = settingsState[0], setSettings = settingsState[1]
+      var draftState = React.useState(null), draft = draftState[0], setDraft = draftState[1]
+      var catalogState = React.useState({ names: [], managed: [], limits: {} }), catalog = catalogState[0], setCatalog = catalogState[1]
+      var diagState = React.useState({ entries: [], status: {} }), diagnostics = diagState[0], setDiagnostics = diagState[1]
+      var editingState = React.useState(false), editing = editingState[0], setEditing = editingState[1]
+      var savingState = React.useState(false), saving = savingState[0], setSaving = savingState[1]
+      var savedState = React.useState(false), saved = savedState[0], setSaved = savedState[1]
+      var importingState = React.useState(false), importing = importingState[0], setImporting = importingState[1]
+      var testingState = React.useState(''), testing = testingState[0], setTesting = testingState[1]
+      var errorState = React.useState(''), error = errorState[0], setError = errorState[1]
+      var fileInput = React.useRef(null), savedTimer = React.useRef(null), testTimer = React.useRef(null)
+
+      var loadSettings = function () { return props.call('settings', { op: 'get' }).then(function (value) { setSettings(value); setDraft(toDraft(value)); return value }) }
+      var loadCatalog = function () { return props.call('sounds', {}).then(function (value) { if (value && Array.isArray(value.names)) setCatalog(value); return value }) }
+      var loadDiagnostics = function () { return props.call('diagnostics', { op: 'get' }).then(setDiagnostics).catch(function () {}) }
+      React.useEffect(function () {
+        Promise.all([loadSettings(), loadCatalog(), loadDiagnostics()]).catch(function (err) { setError(String(err && err.message || '设置读取失败')) })
+        var timer = setInterval(loadDiagnostics, 5000)
+        return function () { clearInterval(timer); if (savedTimer.current) clearTimeout(savedTimer.current); if (testTimer.current) clearTimeout(testTimer.current) }
       }, [])
+      if (!settings || !draft) return h('div', { style: { padding: '12px', opacity: .6 } }, '加载中…')
 
-      if (drafts === null) {
-        return h('div', { style: { padding: '12px', fontSize: '13px', opacity: 0.6 } }, '加载中…')
-      }
-
-      var availableSounds = soundNames.length ? soundNames : FALLBACK_SOUND_NAMES
-      var dirty = SOUND_ROWS.some(function (row) {
-        return (drafts[row[0]] || '') !== (props.savedSounds[row[0]] || '')
-      })
-
-      var beginEdit = function () {
-        setDrafts(Object.assign({}, props.savedSounds))
-        setSaved(false)
-        setError('')
-        setImportedName('')
-        setEditing(true)
-      }
+      var patch = toPatch(draft), dirty = JSON.stringify(patch) !== JSON.stringify(toPatch(toDraft(settings)))
+      var status = diagnostics.status || {}, pauseActive = Number(status.pauseUntil) > Date.now()
+      var availableSounds = catalog.names.length ? catalog.names : FALLBACK_SOUNDS
+      var change = function (field, value) { setDraft(Object.assign({}, draft, { [field]: value })) }
+      var changeSound = function (kind, value) { setDraft(Object.assign({}, draft, { sounds: Object.assign({}, draft.sounds, { [kind]: value }) })) }
+      var beginEdit = function () { setDraft(toDraft(settings)); setEditing(true); setSaved(false); setError('') }
+      var cancel = function () { setDraft(toDraft(settings)); setEditing(false); setError('') }
       var save = function () {
-        if (saving) return
-        var next = {
-          completed: drafts.completed || '',
-          error: drafts.error || '',
-          aborted: drafts.aborted || '',
-          approval: drafts.approval || '',
-        }
-        setSaving(true)
-        setError('')
-        props.saveSettings('sounds', next).then(function (ok) {
-          setSaving(false)
-          if (ok) {
-            setEditing(false)
-            setSaved(true)
-            setImportedName('')
-            if (savedTimer.current) clearTimeout(savedTimer.current)
-            savedTimer.current = setTimeout(function () { setSaved(false) }, 1800)
-          } else {
-            setError('保存失败，请重试')
-          }
-        })
+        if (!dirty || saving) return
+        setSaving(true); setError('')
+        props.call('settings', { op: 'patch', value: patch }).then(function (value) {
+          setSettings(value); setDraft(toDraft(value)); setEditing(false); setSaved(true); loadDiagnostics()
+          if (savedTimer.current) clearTimeout(savedTimer.current)
+          savedTimer.current = setTimeout(function () { setSaved(false) }, 1800)
+        }).catch(function (err) { setError(String(err && err.message || '保存失败')) }).finally(function () { setSaving(false) })
       }
-      var discard = function () {
-        setDrafts(Object.assign({}, props.savedSounds))
-        setEditing(false)
-        setError('')
-        setImportedName('')
+      var test = function (kind, sound) {
+        setTesting(kind); setError('')
+        props.call('test', { kind: kind, sound: sound }).then(loadDiagnostics).catch(function (err) { setError(String(err && err.message || '测试失败')) })
+        if (testTimer.current) clearTimeout(testTimer.current)
+        testTimer.current = setTimeout(function () { setTesting('') }, 1200)
       }
-      var preview = function (kind, sound) {
-        setPreviewing(kind)
-        setError('')
-        if (previewTimer.current) clearTimeout(previewTimer.current)
-        Promise.resolve(props.preview(kind, sound)).catch(function () {
-          setError('试听失败，请检查通知权限')
-        })
-        previewTimer.current = setTimeout(function () { setPreviewing('') }, 1200)
+      var pause = function (duration) {
+        var until = duration ? Date.now() + duration : 0
+        props.call('settings', { op: 'set', field: 'pauseUntil', value: until }).then(function () {
+          setSettings(Object.assign({}, settings, { pauseUntil: until }))
+          setDraft(Object.assign({}, draft, { pauseUntil: until }))
+          return loadDiagnostics()
+        }).catch(function (err) { setError(String(err && err.message || '暂停设置失败')) })
       }
-      var chooseFile = function () {
-        if (!importing && fileInput.current) fileInput.current.click()
-      }
-      var handleFile = function (event) {
-        var file = event.target.files && event.target.files[0]
-        event.target.value = ''
+      var importFile = function (event) {
+        var file = event.target.files && event.target.files[0]; event.target.value = ''
         if (!file) return
-        if (file.size > 5 * 1024 * 1024) {
-          setError('声音文件不能超过 5MB')
-          return
-        }
-        setImporting(true)
-        setImportedName('')
-        setError('')
+        if (file.size > 5 * 1024 * 1024) { setError('声音文件不能超过 5MB'); return }
+        setImporting(true); setError('')
         var reader = new FileReader()
         reader.onload = function () {
-          var encoded = String(reader.result || '').split(',')[1] || ''
-          props.importSound({ filename: file.name, data: encoded }).then(function (result) {
-            var name = result && result.name
-            if (!name) throw new Error('导入结果无效')
-            setSoundNames(function (current) {
-              return current.includes(name) ? current : current.concat(name).sort(function (a, b) { return a.localeCompare(b, 'en') })
-            })
-            setDrafts(function (current) { return Object.assign({}, current, { completed: name }) })
-            setImportedName(name)
-          }).catch(function (err) {
-            setError(String(err && err.message || '声音导入失败'))
-          }).finally(function () {
-            setImporting(false)
-          })
+          props.call('sound/import', { filename: file.name, data: String(reader.result || '').split(',')[1] || '' }).then(function (result) {
+            if (!result || !result.name) throw new Error('导入结果无效')
+            changeSound('completed', result.name); return loadCatalog()
+          }).catch(function (err) { setError(String(err && err.message || '导入失败')) }).finally(function () { setImporting(false) })
         }
-        reader.onerror = function () {
-          setImporting(false)
-          setError('声音文件读取失败')
-        }
+        reader.onerror = function () { setImporting(false); setError('声音文件读取失败') }
         reader.readAsDataURL(file)
       }
+      var deleteSound = function (name, force) {
+        props.call('sound/delete', { name: name, force: !!force }).then(function (result) {
+          if (result && result.requiresConfirmation) {
+            var used = result.inUse.map(function (kind) { return KIND_LABELS[kind] || kind }).join('、')
+            if (window.confirm('“' + name + '”正在用于' + used + '通知。删除后会改为静音，继续吗？')) return deleteSound(name, true)
+            return
+          }
+          var nextSavedSounds = Object.assign({}, settings.sounds)
+          var nextDraftSounds = Object.assign({}, draft.sounds)
+          Object.keys(nextSavedSounds).forEach(function (kind) { if (nextSavedSounds[kind] === name) nextSavedSounds[kind] = '' })
+          Object.keys(nextDraftSounds).forEach(function (kind) { if (nextDraftSounds[kind] === name) nextDraftSounds[kind] = '' })
+          setSettings(Object.assign({}, settings, { sounds: nextSavedSounds }))
+          setDraft(Object.assign({}, draft, { sounds: nextDraftSounds }))
+          return loadCatalog()
+        }).catch(function (err) { setError(String(err && err.message || '删除失败')) })
+      }
+      var updateRule = function (index, field, value) { var rules = draft.projectRules.slice(); rules[index] = Object.assign({}, rules[index], { [field]: value }); change('projectRules', rules) }
+      var removeRule = function (index) { change('projectRules', draft.projectRules.filter(function (_, candidate) { return candidate !== index })) }
+      var addRule = function () { change('projectRules', draft.projectRules.concat({ path: props.getCurrentCwd() || '', mode: 'mute' })) }
 
-      return h('div', {
-        className: saved ? 'dsh-notify-card-saved' : '',
-        style: {
-          border: '1px solid var(--dsw-alias-border-l2, #444)',
-          borderRadius: '10px', padding: '14px 16px', fontSize: '13px',
-          display: 'flex', flexDirection: 'column', gap: '10px',
-        },
-      },
-        h('style', null, feedbackCss),
+      return h('div', { className: saved ? 'dsh-notify-saved' : '', style: { border: '1px solid var(--dsw-alias-border-l2,#444)', borderRadius: '10px', padding: '14px 16px', fontSize: '13px', display: 'flex', flexDirection: 'column', gap: '12px' } },
+        h('style', null, css),
         h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px' } },
-          h('div', { style: { fontWeight: 600 } }, 'macOS 通知'),
-          editing
-            ? h('span', {
-                style: {
-                  padding: '3px 7px', borderRadius: '999px', fontSize: '11px',
-                  background: 'rgba(47, 111, 237, 0.1)', border: '1px solid rgba(47, 111, 237, 0.24)',
-                },
-              }, '编辑中')
-            : h('button', {
-                style: Object.assign({}, buttonStyle, saved ? {
-                  color: '#238452', background: 'rgba(46, 157, 98, 0.12)',
-                  borderColor: 'rgba(46, 157, 98, 0.45)', cursor: 'default',
-                } : {}),
-                disabled: saved,
-                onClick: beginEdit,
-              }, saved ? '已保存 ✓' : '编辑'),
-        ),
-        h('div', { style: { opacity: 0.6, fontSize: '12px' } },
-          '从这台 Mac 的系统声音中选择；静音不会播放声音。OSC 9 通道下声音由终端决定。'),
-        editing ? h('div', {
-          style: {
-            padding: '8px 9px', borderRadius: '7px', background: 'rgba(127, 127, 127, 0.06)',
-            border: '1px solid var(--dsw-alias-border-l2, #444)',
-          },
-        },
-          h('input', {
-            ref: fileInput,
-            type: 'file',
-            accept: '.aac,.aif,.aiff,.caf,.flac,.m4a,.mp3,.oga,.ogg,.opus,.wav,audio/*',
-            style: { display: 'none' },
-            onChange: handleFile,
-          }),
-          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' } },
-            h('span', { style: { fontSize: '12px', opacity: 0.7, lineHeight: 1.4 } },
-              '支持常见音频，最大 5MB、10 秒；导入后自动用于任务完成。'),
-            h('button', {
-              style: Object.assign({}, buttonStyle, { flex: '0 0 auto', whiteSpace: 'nowrap' }),
-              disabled: importing,
-              onClick: chooseFile,
-            }, importing ? '导入中…' : '导入声音'),
-          ),
-          importedName ? h('div', {
-            role: 'status',
-            style: { marginTop: '7px', color: '#238452', fontSize: '12px' },
-          }, `✓ 已导入 ${importedName}`) : null,
-        ) : null,
-        error ? h('div', {
-          className: 'dsh-notify-error', role: 'alert',
-          style: {
-            padding: '7px 9px', borderRadius: '6px', color: '#d94b43', fontSize: '12px',
-            background: 'rgba(217, 75, 67, 0.1)', border: '1px solid rgba(217, 75, 67, 0.24)',
-          },
-        }, error) : null,
-        SOUND_ROWS.map(function (row) {
-          var kind = row[0]
-          var value = editing ? (drafts[kind] || '') : (props.savedSounds[kind] || '')
-          var isPreviewing = previewing === kind
-          var choices = availableSounds.includes(value) || !value
-            ? availableSounds
-            : [value].concat(availableSounds)
-          return h('div', {
-            key: kind,
-            style: { display: 'flex', alignItems: 'center', gap: '8px', width: '100%' },
-          },
-            h('span', { style: { width: '72px', flex: '0 0 72px', lineHeight: 1.35 } }, row[1]),
-            editing
-              ? h('select', {
-                  style: Object.assign({}, inputStyle, { width: 'auto', minWidth: 0, flex: '1 1 100px' }),
-                  value: value,
-                  'aria-label': row[1] + '提示音',
-                  onChange: function (e) {
-                    var next = Object.assign({}, drafts)
-                    next[kind] = e.target.value
-                    setDrafts(next)
-                  },
-                },
-                  h('option', { value: '' }, '静音'),
-                  choices.map(function (name) { return h('option', { key: name, value: name }, name) }))
-              : h('span', {
-                  style: {
-                    minWidth: 0, flex: '1 1 100px', padding: '4px 8px', borderRadius: '6px',
-                    background: 'rgba(127, 127, 127, 0.08)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                  },
-                }, value || '静音'),
-            h('button', {
-              style: Object.assign({}, buttonStyle, {
-                width: '68px', flex: '0 0 68px', padding: '4px 6px', whiteSpace: 'nowrap',
-                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '5px',
-                borderColor: isPreviewing ? 'rgba(46, 157, 98, 0.5)' : 'var(--dsw-alias-border-l2, #444)',
-                background: isPreviewing ? 'rgba(46, 157, 98, 0.12)' : 'transparent',
-                color: isPreviewing ? '#238452' : 'inherit',
-              }),
-              'aria-label': row[1] + '提示音试听',
-              onClick: function () { preview(kind, value) },
-            },
-              isPreviewing ? h('span', { className: 'dsh-notify-wave', 'aria-hidden': 'true' },
-                h('i'), h('i'), h('i')) : null,
-              isPreviewing ? '播放中' : '试听'),
-          )
-        }),
-        editing ? h('div', { style: { display: 'flex', gap: '8px', marginTop: '4px' } },
-          h('button', {
-            style: Object.assign({}, buttonStyle, { fontWeight: 600, minWidth: '72px' }),
-            disabled: !dirty || saving || importing,
-            onClick: save,
-          }, saving ? '保存中…' : '保存'),
-          h('button', { style: buttonStyle, disabled: saving || importing, onClick: discard }, '取消'),
-        ) : null,
-      )
+          h('div', null, h('strong', null, 'macOS 通知'), h('div', { style: { opacity: .55, fontSize: '11px', marginTop: '2px' } }, '通道：' + (status.channel || settings.channel) + ' · 诊断记录 ' + diagnostics.entries.length + ' 条')),
+          editing ? h('span', { style: { padding: '3px 7px', borderRadius: '99px', fontSize: '11px', background: 'rgba(47,111,237,.1)' } }, '整体编辑中') : h('button', { style: buttonStyle, disabled: saved, onClick: beginEdit }, saved ? '已保存 ✓' : '编辑全部')),
+        error ? h('div', { className: 'dsh-notify-error', role: 'alert', style: { padding: '7px 9px', borderRadius: '6px', color: '#d94b43', background: 'rgba(217,75,67,.1)' } }, error) : null,
+
+        h('div', { style: sectionStyle }, h(SectionTitle, { title: '运行状态与测试', note: status.quietActive ? '当前处于勿扰时段' : pauseActive ? '通知已暂停' : '运行正常' }),
+          h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } }, ['completed', 'error', 'approval', 'aborted', 'coalesced', 'digest'].map(function (kind) {
+            var names = { completed: '完成', error: '错误', approval: '审批', aborted: '中断', coalesced: '合并', digest: '摘要' }
+            return h('button', { key: kind, style: buttonStyle, onClick: function () { test(kind, draft.sounds[kind]) } }, testing === kind ? '发送中…' : '测试' + names[kind])
+          })),
+          h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap', alignItems: 'center' } }, h('small', { style: { opacity: .55 } }, pauseActive ? '暂停至 ' + new Date(status.pauseUntil).toLocaleTimeString() : '临时暂停：'),
+            h('button', { style: buttonStyle, onClick: function () { pause(30 * 60 * 1000) } }, '30 分钟'), h('button', { style: buttonStyle, onClick: function () { pause(60 * 60 * 1000) } }, '1 小时'), h('button', { style: buttonStyle, onClick: function () { pause(24 * 60 * 60 * 1000) } }, '24 小时'), pauseActive ? h('button', { style: buttonStyle, onClick: function () { pause(0) } }, '立即恢复') : null)),
+
+        h('div', { style: sectionStyle }, h(SectionTitle, { title: '通知事件与过滤' }),
+          [['onCompleted', '任务完成'], ['onError', '错误与阻止'], ['onApproval', '等待审批'], ['onAborted', '用户中断']].map(function (row) { return h(Toggle, { key: row[0], disabled: !editing, value: draft[row[0]], label: row[1], onChange: function (value) { change(row[0], value) } }) }),
+          h(Toggle, { disabled: !editing, value: draft.onlyWhenUnfocused, label: '仅在 DSH 页面未聚焦时发送完成通知', onChange: function (value) { change('onlyWhenUnfocused', value) } }),
+          h(Toggle, { disabled: !editing, value: draft.includeSubagents, label: '包含子 Agent 会话', onChange: function (value) { change('includeSubagents', value) } }),
+          [['minDurationSec', '完成通知最短耗时（秒）'], ['onlyWhenIdleSec', '键鼠空闲门槛（秒）'], ['digestMinutes', '摘要间隔（分钟）'], ['coalesceMs', '合并窗口（毫秒）'], ['duplicateWindowSec', '重复错误抑制（秒）']].map(function (row) { return h(SettingRow, { key: row[0], label: row[1] }, h('input', { style: inputStyle, type: 'number', min: 0, disabled: !editing, value: draft[row[0]], onChange: function (e) { change(row[0], e.target.value) } })) }),
+          h(SettingRow, { label: '通知通道' }, h('select', { style: inputStyle, disabled: !editing, value: draft.channel, onChange: function (e) { change('channel', e.target.value) } }, h('option', { value: 'auto' }, '自动'), h('option', { value: 'osascript' }, 'osascript'), h('option', { value: 'osc9' }, 'OSC 9')))),
+
+        h('div', { style: sectionStyle }, h(SectionTitle, { title: '每日勿扰', note: '使用本机时间' }),
+          h(Toggle, { disabled: !editing, value: draft.quietHoursEnabled, label: '启用每日勿扰时段', onChange: function (value) { change('quietHoursEnabled', value) } }),
+          h(SettingRow, { label: '时段' }, h('span', { style: { display: 'flex', alignItems: 'center', gap: '6px' } }, h('input', { 'aria-label': '勿扰开始时间', style: Object.assign({}, inputStyle, { width: '104px' }), type: 'time', disabled: !editing, value: draft.quietStart, onChange: function (e) { change('quietStart', e.target.value) } }), h('span', null, '至'), h('input', { 'aria-label': '勿扰结束时间', style: Object.assign({}, inputStyle, { width: '104px' }), type: 'time', disabled: !editing, value: draft.quietEnd, onChange: function (e) { change('quietEnd', e.target.value) } }))),
+          h(Toggle, { disabled: !editing, value: draft.quietAllowCritical, label: '勿扰时仍允许错误、阻止和审批', onChange: function (value) { change('quietAllowCritical', value) } })),
+
+        h('div', { style: sectionStyle }, h(SectionTitle, { title: '提示音', note: '单个≤5MB/10秒；最多20个/50MB' }),
+          editing ? h('div', { style: rowStyle }, h('input', { ref: fileInput, type: 'file', accept: '.aac,.aif,.aiff,.caf,.flac,.m4a,.mp3,.oga,.ogg,.opus,.wav,audio/*', style: { display: 'none' }, onChange: importFile }), h('button', { style: buttonStyle, disabled: importing, onClick: function () { if (fileInput.current) fileInput.current.click() } }, importing ? '导入中…' : '导入声音'), h('small', { style: { opacity: .55 } }, '已管理 ' + catalog.managed.length + ' 个')) : null,
+          SOUND_ROWS.map(function (row) { var kind = row[0], value = draft.sounds[kind] || '', choices = availableSounds.includes(value) || !value ? availableSounds : [value].concat(availableSounds); return h('div', { key: kind, style: rowStyle }, h('span', { style: { width: '110px' } }, row[1]), h('select', { style: Object.assign({}, inputStyle, { flex: 1, width: 'auto' }), disabled: !editing, value: value, onChange: function (e) { changeSound(kind, e.target.value) } }, h('option', { value: '' }, '静音'), choices.map(function (name) { return h('option', { key: name, value: name }, name) })), h('button', { style: buttonStyle, onClick: function () { test(kind, value) } }, testing === kind ? '播放中…' : '试听')) }),
+          catalog.managed.length ? h('div', { style: { padding: '8px', borderRadius: '7px', background: 'rgba(127,127,127,.06)' } }, catalog.managed.map(function (item) { return h('div', { key: item.name, style: rowStyle }, h('span', { style: { flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' } }, item.name), h('small', { style: { opacity: .5 } }, (item.bytes / 1024).toFixed(0) + 'KB'), editing ? h('button', { style: Object.assign({}, buttonStyle, { color: '#d94b43' }), onClick: function () { deleteSound(item.name, false) } }, '删除') : null) })) : null),
+
+        h('div', { style: sectionStyle }, h(SectionTitle, { title: '项目规则', note: '更具体的路径优先' }),
+          draft.projectRules.length ? draft.projectRules.map(function (rule, index) { return h('div', { key: index, style: { display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 150px auto', gap: '6px' } }, h('input', { style: Object.assign({}, inputStyle, { width: '100%' }), disabled: !editing, value: rule.path, placeholder: '/Users/name/project', onChange: function (e) { updateRule(index, 'path', e.target.value) } }), h('select', { style: Object.assign({}, inputStyle, { width: '100%' }), disabled: !editing, value: rule.mode, onChange: function (e) { updateRule(index, 'mode', e.target.value) } }, Object.keys(RULE_LABELS).map(function (mode) { return h('option', { key: mode, value: mode }, RULE_LABELS[mode]) })), editing ? h('button', { style: Object.assign({}, buttonStyle, { color: '#d94b43' }), onClick: function () { removeRule(index) } }, '移除') : h('span')) }) : h('small', { style: { opacity: .55 } }, '尚未配置项目规则'),
+          editing ? h('button', { style: Object.assign({}, buttonStyle, { alignSelf: 'flex-start' }), onClick: addRule }, props.getCurrentCwd() ? '添加当前项目' : '添加规则') : null),
+
+        h('div', { style: sectionStyle }, h(SectionTitle, { title: '最近通知诊断', note: '当前进程最近50条' }),
+          diagnostics.entries.length ? diagnostics.entries.slice(0, 12).map(function (entry) { var colors = { sent: '#238452', suppressed: '#b36b00', queued: '#3867c8', error: '#d94b43' }, labels = { sent: '已发送', suppressed: '已抑制', queued: '排队中', error: '失败' }; return h('div', { key: entry.id, style: { display: 'grid', gridTemplateColumns: '58px minmax(0,1fr) auto', gap: '7px', padding: '6px 0', borderBottom: '1px solid rgba(127,127,127,.12)' } }, h('span', { style: { color: colors[entry.status], fontSize: '11px', fontWeight: 600 } }, labels[entry.status] || entry.status), h('span', null, h('b', null, entry.label || entry.title || entry.kind), h('small', { style: { display: 'block', opacity: .55 } }, entry.detail)), h('small', { style: { opacity: .45, whiteSpace: 'nowrap' } }, new Date(entry.time).toLocaleTimeString())) }) : h('small', { style: { opacity: .55 } }, '暂无记录，可以点击上方测试按钮。'),
+          diagnostics.entries.length ? h('button', { style: Object.assign({}, buttonStyle, { alignSelf: 'flex-start' }), onClick: function () { props.call('diagnostics', { op: 'clear' }).then(setDiagnostics) } }, '清空记录') : null),
+
+        editing ? h('div', { style: { position: 'sticky', bottom: '8px', display: 'flex', gap: '8px', padding: '9px', borderRadius: '8px', background: 'var(--dsw-alias-bg-primary,#1d1d1d)', border: '1px solid var(--dsw-alias-border-l2,#444)', boxShadow: '0 5px 18px rgba(0,0,0,.18)' } }, h('button', { style: Object.assign({}, buttonStyle, { fontWeight: 650 }), disabled: !dirty || saving || importing, onClick: save }, saving ? '保存中…' : dirty ? '保存全部' : '没有改动'), h('button', { style: buttonStyle, disabled: saving || importing, onClick: cancel }, '取消')) : null)
     }
 
-    // 卡片外层的受控封装：持有「已保存的 sounds」，让脏检测有据可依
-    function SoundCardContainer(props) {
-      var savedState = React.useState({})
-      var savedSounds = savedState[0]
-      var setSavedSounds = savedState[1]
-      var getSettings = function () {
-        return props.call('settings', { op: 'get' }).then(function (value) {
-          if (value && value.sounds) setSavedSounds(Object.assign({}, value.sounds))
-          return value
-        })
-      }
-      var saveSettings = function (field, value) {
-        return props.call('settings', { op: 'set', field: field, value: value }).then(function () {
-          setSavedSounds(Object.assign({}, value))
-          return true
-        }).catch(function () { return false })
-      }
-      return h(SoundCard, {
-        getSettings: getSettings,
-        importSound: function (payload) { return props.call('sound/import', payload) },
-        listSounds: function () { return props.call('sounds', {}) },
-        saveSettings: saveSettings,
-        savedSounds: savedSounds,
-        preview: props.preview,
-      })
-    }
-
-    exports.inject = ['connection', 'slots']
-
+    exports.inject = ['connection', 'slots', 'sessions']
     exports.apply = function apply(ctx) {
-      // —— 焦点上报 ——
-      // 每个 tab 一个稳定 id，宿主侧按 id 去重；关 tab 后由宿主侧过期清理
       var clientId = crypto.randomUUID()
-      var report = function () {
-        var focused = document.visibilityState === 'visible' && document.hasFocus()
-        ctx.connection.rpc.call('/macos-notify', 'visibility', {
-          id: clientId,
-          focused: focused,
-        }).catch(function () {})
-      }
-      report()
-      document.addEventListener('visibilitychange', report)
-      window.addEventListener('focus', report)
-      window.addEventListener('blur', report)
-      // 心跳：让宿主侧能区分「tab 还开着但没焦点」和「tab 已关闭」
+      var report = function () { ctx.connection.rpc.call('/macos-notify', 'visibility', { id: clientId, focused: document.visibilityState === 'visible' && document.hasFocus() }).catch(function () {}) }
+      report(); document.addEventListener('visibilitychange', report); window.addEventListener('focus', report); window.addEventListener('blur', report)
       var timer = setInterval(report, 30000)
-
-      // —— 设置卡片 ——
-      var call = function (endpoint, payload) {
-        return ctx.connection.rpc.call('/macos-notify', endpoint, payload).then(function (result) {
-          if (!result || result.ok !== true) throw new Error((result && result.error && result.error.message) || 'rpc failed')
-          return result.value
-        })
-      }
-      // settings.plugin.item 由「可配置」标签页声明，必须用 slots.inject 挂进去
-      ctx.slots.inject('settings.plugin.item', function* () {
-        yield ctx.slots.register({
-          name: 'settings.plugin.item',
-          id: 'macos-notify',
-          order: 100,
-          inject: () => ({
-            call: call,
-            preview: (kind, sound) => {
-              return call('test', { kind: kind, sound: sound })
-            },
-          }),
-        }, SoundCardContainer)
-      })
-
-      ctx.effect(function () {
-        return function () {
-          clearInterval(timer)
-          document.removeEventListener('visibilitychange', report)
-          window.removeEventListener('focus', report)
-          window.removeEventListener('blur', report)
-        }
-      })
+      var call = function (endpoint, payload) { return ctx.connection.rpc.call('/macos-notify', endpoint, payload).then(function (result) { if (!result || result.ok !== true) throw new Error(result && result.error && result.error.message || 'RPC 调用失败'); return result.value }) }
+      var getCurrentCwd = function () { try { var state = ctx.sessions.list.getSnapshot(); return state.current && state.byId[state.current] && state.byId[state.current].cwd || '' } catch { return '' } }
+      ctx.slots.inject('settings.plugin.item', function* () { yield ctx.slots.register({ name: 'settings.plugin.item', id: 'macos-notify', order: 100, inject: function () { return { call: call, getCurrentCwd: getCurrentCwd } } }, Card) })
+      ctx.effect(function () { return function () { clearInterval(timer); document.removeEventListener('visibilitychange', report); window.removeEventListener('focus', report); window.removeEventListener('blur', report) } })
     }
-
     return module.exports
   },
 })
