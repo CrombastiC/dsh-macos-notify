@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { apply } from '../index.js'
 
@@ -54,6 +55,19 @@ function createHarness(overrides = {}) {
 }
 
 const session = { id: 'session-test', header: { cwd: '/tmp/project' } }
+
+test('registers the Web UI as a first-level settings section', () => {
+  const clientSource = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const hostSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.match(clientSource, /ctx\.slots\.inject\('settings\.section'/)
+  assert.match(clientSource, /name: 'settings\.section'/)
+  assert.match(clientSource, /label: 'macOS 通知'/)
+  assert.doesNotMatch(clientSource, /settings\.plugin\.item/)
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-settings'))
+  assert.doesNotMatch(hostSource, /macOS 通知插件已加载/)
+  assert.match(hostSource, /macOS 通知插件加载失败/)
+})
 
 test('records minimum-duration suppression', async () => {
   const app = createHarness({ minDurationSec: 30 })

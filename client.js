@@ -196,7 +196,15 @@ window.__ModuleLoader__.load({
       var timer = setInterval(report, 30000)
       var call = function (endpoint, payload) { return ctx.connection.rpc.call('/macos-notify', endpoint, payload).then(function (result) { if (!result || result.ok !== true) throw new Error(result && result.error && result.error.message || 'RPC 调用失败'); return result.value }) }
       var getCurrentCwd = function () { try { var state = ctx.sessions.list.getSnapshot(); return state.current && state.byId[state.current] && state.byId[state.current].cwd || '' } catch { return '' } }
-      ctx.slots.inject('settings.plugin.item', function* () { yield ctx.slots.register({ name: 'settings.plugin.item', id: 'macos-notify', order: 100, inject: function () { return { call: call, getCurrentCwd: getCurrentCwd } } }, Card) })
+      ctx.slots.inject('settings.section', function () {
+        return ctx.slots.register({
+          name: 'settings.section',
+          id: 'macos-notify',
+          order: 100,
+          label: 'macOS 通知',
+          inject: function () { return { call: call, getCurrentCwd: getCurrentCwd } },
+        }, Card)
+      })
       ctx.effect(function () { return function () { clearInterval(timer); document.removeEventListener('visibilitychange', report); window.removeEventListener('focus', report); window.removeEventListener('blur', report) } })
     }
     return module.exports

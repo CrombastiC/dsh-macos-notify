@@ -1,12 +1,12 @@
 # dsh-macos-notify
 
-Native macOS notifications for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), with event-specific sounds, notification filtering, multi-task coalescing, and a settings card in the DSH Web UI.
+Native macOS notifications for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), with event-specific sounds, notification filtering, multi-task coalescing, and a first-level settings page in the DSH Web UI.
 
 ## Features
 
 - Notification Center alerts when a turn completes, fails, is blocked, or waits for approval.
 - Separate sounds for completed, error, aborted, and approval events; any event can be muted.
-- System sound picker plus managed custom sound import and deletion from the Web settings card.
+- System sound picker plus managed custom sound import and deletion from the Web settings page.
 - Custom imports are converted to AIFF, limited to 5 MB and 10 seconds, capped at 20 managed files / 50 MB total, and stored in `~/Library/Sounds`.
 - A 1.5-second coalescing window and optional digest mode prevent parallel tasks from flooding Notification Center.
 - Recent notification diagnostics explain whether an event was sent, queued, suppressed, or failed.
@@ -41,7 +41,7 @@ Alternatively, install the latest source directly from GitHub:
 npx -y @deepseek-ai/dsh plugin --profile web add github:CrombastiC/dsh-macos-notify
 ```
 
-Then open **Settings → Plugins → Plugin configuration → macOS notifications**.
+Then open **Settings → macOS notifications** from the first-level settings navigation.
 
 To remove the plugin:
 
@@ -88,7 +88,6 @@ The settings namespace is `macos-notify`. Values changed from the Web card apply
 | `pauseUntil` | `0` | Temporary pause deadline as Unix milliseconds; managed by quick actions in the Web card. |
 | `duplicateWindowSec` | `300` | Suppress identical errors from the same session within this window; `0` disables it. |
 | `projectRulesJson` | `[]` | Project rules managed by the Web card. More-specific descendant paths win. |
-| `notifyOnLoad` | `true` | Send a test notification when the plugin loads. |
 
 ### Project rule modes
 
@@ -96,7 +95,7 @@ The settings namespace is `macos-notify`. Values changed from the Web card apply
 - `errors` — allow only errors, blocked events, and approval requests.
 - `important` — bypass minimum-duration, focus, idle, quiet-hour, and temporary-pause filters.
 
-The settings card keeps the last 50 decisions in process memory. Each row records whether an event was sent, queued, suppressed, or failed and includes the reason. This history resets when DSH restarts and does not contain message content.
+The settings page keeps the last 50 decisions in process memory. Each row records whether an event was sent, queued, suppressed, or failed and includes the reason. This history resets when DSH restarts and does not contain message content.
 
 ## Notification channels
 
@@ -108,17 +107,17 @@ Sound selection applies to the `osascript` channel. With OSC 9, the terminal con
 
 ## Custom sounds
 
-In the settings card, select **Edit → Import sound**. Supported inputs include AAC, AIFF, CAF, FLAC, M4A, MP3, OGG, Opus, and WAV.
+In the settings page, select **Edit → Import sound**. Supported inputs include AAC, AIFF, CAF, FLAC, M4A, MP3, OGG, Opus, and WAV.
 
 The host validates the extension, decoded size, converted duration, managed-file count, and total managed size before writing anything to the user sound directory. Imports are converted to 44.1 kHz mono AIFF using macOS `afconvert`, with `ffmpeg` as a fallback for formats that `afconvert` cannot decode. Existing files are never overwritten; a numeric suffix is added instead.
 
-New imports are recorded in `~/Library/Application Support/dsh-macos-notify/sounds.json` and can be deleted from the settings card. If a sound is currently selected, deletion asks for confirmation and changes affected events to silent. Files remain in `~/Library/Sounds` if the plugin is removed without deleting them first.
+New imports are recorded in `~/Library/Application Support/dsh-macos-notify/sounds.json` and can be deleted from the settings page. If a sound is currently selected, deletion asks for confirmation and changes affected events to silent. Files remain in `~/Library/Sounds` if the plugin is removed without deleting them first.
 
 ## Known limitations
 
 - The plugin is macOS-only. Native notifications use `osascript`, and custom import uses macOS audio tooling.
 - OSC 9 sound behavior belongs to the terminal and ignores the per-event sound selection.
-- The Web settings card uses the trusted `/macos-notify` RPC channel because the current DSH Web settings proxy has a namespace allowlist for built-in settings.
+- The Web settings page uses the trusted `/macos-notify` RPC channel because the current DSH Web settings proxy has a namespace allowlist for built-in settings.
 - Only sounds imported by v0.2.0 or later are tracked as managed sounds. Earlier manually copied/imported files can still be selected, but must be removed from `~/Library/Sounds` manually.
 
 ## Development
@@ -126,7 +125,7 @@ New imports are recorded in `~/Library/Application Support/dsh-macos-notify/soun
 The package is intentionally build-free:
 
 - `index.js` — host plugin, event handling, notification delivery, settings RPC, and sound import.
-- `client.js` — hand-written DSH client module for focus reporting and the Web settings card.
+- `client.js` — hand-written DSH client module for focus reporting and the first-level Web settings page.
 - `cordis.patch.yml` — profile bundle patch.
 
 Run the release checks:

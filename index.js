@@ -53,8 +53,8 @@ export const Config = Schema.object({
   duplicateWindowSec: Schema.number().default(300),
   /** 项目规则 JSON：[{ path, mode }]，mode 为 mute / errors / important */
   projectRulesJson: Schema.string().default('[]'),
-  /** 插件加载时发一条测试通知 */
-  notifyOnLoad: Schema.boolean().default(true),
+  /** 兼容旧配置；成功加载现在始终静默，仅初始化失败时提醒 */
+  notifyOnLoad: Schema.boolean().default(false),
 })
 
 /** 设置页可编辑的提示音字段 */
@@ -295,6 +295,11 @@ function notify(title, body, sound, channel, onResult = () => {}) {
   })
 }
 
+function notifyStartupFailure(err, sound = 'Basso') {
+  const detail = String(err?.message ?? err ?? '未知错误').replace(/\s+/g, ' ').trim().slice(0, 180)
+  notify('DSH', `macOS 通知插件加载失败：${detail || '未知错误'}`, sound, 'osascript')
+}
+
 // —— OSC 9 通道（思路参考 kimi-code 的 terminal-notification.ts）——
 
 /** 认识 OSC 9 桌面通知的终端白名单；不认识 OSC 9 的终端收到转义序列会打印乱码，所以必须保守 */
@@ -378,7 +383,7 @@ function isCriticalKind(kind) {
   return kind === '出错' || kind === '被阻止' || kind === '审批'
 }
 
-export function apply(ctx, config) {
+function applyImpl(ctx, config) {
   // 配置三层叠加：schema 默认值 < cordis 组合层（base = 插件 config）< 用户层（设置页）。
   // 设置页写入后经 watch 实时生效，不需要重启。
   const scope = ctx.settings.register('macos-notify', Config, { base: config, applies: 'live' })
@@ -597,6 +602,7 @@ export function apply(ctx, config) {
       console.log('[dsh-macos-notify] RPC intercept mounted')
     } catch (err) {
       console.error('[dsh-macos-notify] RPC intercept failed:', err)
+      notifyStartupFailure(err, current.sounds.error)
     }
   })
 
@@ -780,10 +786,6 @@ export function apply(ctx, config) {
     if (!flushTimer) flushTimer = setTimeout(flush, current.coalesceMs)
   }
 
-  if (current.notifyOnLoad) {
-    send('DSH', 'macOS 通知插件已加载', current.sounds.completed, [], { detail: '插件加载测试通知' })
-  }
-
   ctx.on('session/event', (session, event) => {
     if (event.type === 'session/title') {
       titles.set(session.id, event.data.title)
@@ -855,4 +857,14 @@ export function apply(ctx, config) {
     if (flushTimer) clearTimeout(flushTimer)
     if (digestTimer) clearInterval(digestTimer)
   })
+}
+
+export function apply(ctx, config) {
+  try {
+    return applyImpl(ctx, config)
+  } catch (err) {
+    console.error('[dsh-macos-notify] plugin initialization failed:', err)
+    notifyStartupFailure(err, config?.sounds?.error)
+    throw err
+  }
 }
