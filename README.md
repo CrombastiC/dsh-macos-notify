@@ -28,11 +28,17 @@ Native macOS notifications for [DeepSeek Harness](https://github.com/deepseek-ai
 
 ## Install
 
-The first release is distributed from GitHub. npm publication is intentionally deferred.
+Install the published npm package:
+
+```bash
+npx -y @deepseek-ai/dsh plugin --profile web add dsh-macos-notify
+npx -y @deepseek-ai/dsh web
+```
+
+Alternatively, install the latest source directly from GitHub:
 
 ```bash
 npx -y @deepseek-ai/dsh plugin --profile web add github:CrombastiC/dsh-macos-notify
-npx -y @deepseek-ai/dsh web
 ```
 
 Then open **Settings → Plugins → Plugin configuration → macOS notifications**.
@@ -134,7 +140,7 @@ npm pack --dry-run
 
 ## 中文说明
 
-这是一个仅支持 macOS 的 DeepSeek Harness 通知插件。它可以在任务完成、出错、等待审批时发送系统通知，并支持通知诊断、测试矩阵、每日勿扰、临时暂停、自定义声音管理、重复错误抑制、项目规则、焦点抑制、合并通知和定时汇总。当前通过 GitHub 安装，不发布到 npm。
+这是一个仅支持 macOS 的 DeepSeek Harness 通知插件。它可以在任务完成、出错、等待审批时发送系统通知，并支持通知诊断、测试矩阵、每日勿扰、临时暂停、自定义声音管理、重复错误抑制、项目规则、焦点抑制、合并通知和定时汇总。推荐从 npm 安装，也可以直接从 GitHub 安装最新版源码。
 
 ## License
 
