@@ -6,12 +6,13 @@ Native macOS notifications for [DeepSeek Harness](https://github.com/deepseek-ai
 
 - Notification Center alerts when a turn completes, fails, is blocked, or waits for approval.
 - Separate sounds for completed, error, aborted, and approval events; any event can be muted.
-- System sound picker plus managed custom sound import and deletion from the Web settings page.
+- System sound picker, in-page sound preview via afplay, and managed custom sound import and deletion from the Web settings page.
 - Custom imports are converted to AIFF, limited to 5 MB and 10 seconds, capped at 20 managed files / 50 MB total, and stored in `~/Library/Sounds`.
 - A 1.5-second coalescing window and optional digest mode prevent parallel tasks from flooding Notification Center.
-- Recent notification diagnostics explain whether an event was sent, queued, suppressed, or failed.
+- Recent notification diagnostics explain whether an event was sent, queued, suppressed, or failed; they persist across restarts.
 - A six-event test matrix validates completed, error, approval, aborted, coalesced, and digest notifications.
-- Daily quiet hours and temporary 30-minute, 1-hour, or 24-hour pauses.
+- Daily quiet hours and temporary pauses with custom durations and a remaining-time display.
+- Common toggles and the sound picker save instantly from the read-only view; number inputs are clamped to safe ranges.
 - Duplicate error suppression with a configurable cooldown window.
 - Project path rules for muting, error-only alerts, or important-project bypasses.
 - Minimum turn-duration filtering avoids notifications for near-instant replies.
@@ -95,7 +96,7 @@ The settings namespace is `macos-notify`. Values changed from the Web card apply
 - `errors` — allow only errors, blocked events, and approval requests.
 - `important` — bypass minimum-duration, focus, idle, quiet-hour, and temporary-pause filters.
 
-The settings page keeps the last 50 decisions in process memory. Each row records whether an event was sent, queued, suppressed, or failed and includes the reason. This history resets when DSH restarts and does not contain message content.
+The settings page keeps the last 50 decisions, the duplicate-error cooldown state, and recent session titles, persisted to `~/Library/Application Support/dsh-macos-notify/state.json` so they survive DSH restarts. Each row records whether an event was sent, queued, suppressed, or failed and includes the reason. This history does not contain message content.
 
 ## Notification channels
 
@@ -126,6 +127,8 @@ The package is intentionally build-free:
 
 - `index.js` — host plugin, event handling, notification delivery, settings RPC, and sound import.
 - `client.js` — hand-written DSH client module for focus reporting and the first-level Web settings page.
+- `src/policy.js` — pure policy helpers (quiet hours, project rules, duplicate merging) covered by unit tests.
+- `src/state.js` — validated, atomic persistence for diagnostics, duplicate state, and session titles.
 - `cordis.patch.yml` — profile bundle patch.
 
 Run the release checks:
@@ -139,7 +142,7 @@ npm pack --dry-run
 
 ## 中文说明
 
-这是一个仅支持 macOS 的 DeepSeek Harness 通知插件。它可以在任务完成、出错、等待审批时发送系统通知，并支持通知诊断、测试矩阵、每日勿扰、临时暂停、自定义声音管理、重复错误抑制、项目规则、焦点抑制、合并通知和定时汇总。推荐从 npm 安装，也可以直接从 GitHub 安装最新版源码。
+这是一个仅支持 macOS 的 DeepSeek Harness 通知插件。它可以在任务完成、出错、等待审批时发送系统通知，并支持通知诊断（跨重启持久化）、afplay 本地试听、测试矩阵、每日勿扰、自定义时长的临时暂停、自定义声音管理与导入指派、常用开关即时保存、重复错误抑制、项目路径自动补全、焦点抑制、合并通知和定时汇总。推荐从 npm 安装，也可以直接从 GitHub 安装最新版源码。
 
 ## License
 

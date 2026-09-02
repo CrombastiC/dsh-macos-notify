@@ -1,6 +1,6 @@
 {
   "name": "dsh-macos-notify",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Native macOS notifications and configurable sounds for DeepSeek Harness",
   "type": "module",
   "main": "index.js",
@@ -9,7 +9,7 @@
     "./client": "./client.js",
     "./package.json": "./package.json"
   },
-  "files": ["index.js", "client.js", "cordis.patch.yml"],
+  "files": ["index.js", "client.js", "src/policy.js", "src/state.js", "cordis.patch.yml"],
   "keywords": ["dsh-plugin", "deepseek-harness", "macos", "notifications"],
   "author": "CrombastiC",
   "license": "MIT",
@@ -30,7 +30,8 @@
   },
   "os": ["darwin"],
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "prepublishOnly": "node --check index.js && node --check client.js && node --check src/policy.js && node --check src/state.js && npm test"
   },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },

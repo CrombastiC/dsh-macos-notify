@@ -5,6 +5,19 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, extname, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import Schema from '@deepseek-ai/schemastery'
+import {
+  DuplicateTracker,
+  TtlCache,
+  buildNotificationScript,
+  duplicateKey,
+  isCompletionKind,
+  isCriticalKind,
+  matchingProjectRule,
+  minuteOfDay,
+  parseProjectRules,
+  quietHoursActive,
+} from './src/policy.js'
+import { loadStateSync, saveState } from './src/state.js'
 
 export const name = 'dsh-macos-notify'
 export const inject = ['sessions', 'settings']
@@ -76,6 +89,12 @@ function userSoundsDir() {
 
 function soundRegistryPath() {
   return join(homedir(), 'Library/Application Support/dsh-macos-notify/sounds.json')
+}
+
+/** 决策历史与重复合并状态的落盘位置；测试可通过 DSH_MACOS_NOTIFY_STATE_FILE 重定向 */
+function stateFilePath() {
+  return process.env.DSH_MACOS_NOTIFY_STATE_FILE
+    || join(homedir(), 'Library/Application Support/dsh-macos-notify/state.json')
 }
 
 async function readSoundRegistry() {
@@ -245,6 +264,31 @@ async function deleteManagedSound(name) {
   await writeSoundRegistry(registry)
 }
 
+/** 试听：把声音名解析为磁盘文件后交给 afplay 本地播放，不经过通知通道 */
+async function previewSound(name) {
+  if (!name || name.includes('/') || name.includes('\\') || name.includes('..')) {
+    throw new Error('声音名无效')
+  }
+  const dir = userSoundsDir()
+  const registry = await readSoundRegistry()
+  const managed = registry.find((item) => item.name === name)
+  const candidates = managed ? [join(dir, managed.filename)] : []
+  for (const base of ['/System/Library/Sounds', '/Library/Sounds', dir]) {
+    for (const extension of SOUND_EXTENSIONS) candidates.push(join(base, `${name}${extension}`))
+  }
+  for (const candidate of candidates) {
+    try {
+      const info = await stat(candidate)
+      if (!info.isFile()) continue
+    } catch {
+      continue
+    }
+    await execFileAsync('/usr/bin/afplay', [candidate])
+    return
+  }
+  throw new Error('找不到声音文件')
+}
+
 /** macOS 系统与用户声音目录；读取失败的目录直接忽略 */
 async function systemSoundNames() {
   const dirs = [
@@ -277,19 +321,13 @@ async function soundCatalog() {
   }
 }
 
-function esc(s) {
-  return String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
-}
-
 function notify(title, body, sound, channel, onResult = () => {}) {
   if (channel === 'osc9') {
     emitOsc9(title, body)
     onResult(null)
     return
   }
-  const soundPart = sound ? ` sound name "${esc(sound)}"` : ''
-  const script = `display notification "${esc(body)}" with title "${esc(title)}"${soundPart}`
-  execFile('osascript', ['-e', script], (err) => {
+  execFile('osascript', ['-e', buildNotificationScript(title, body, sound)], (err) => {
     if (err) console.warn('[dsh-macos-notify] osascript failed:', err.message)
     onResult(err ?? null)
   })
@@ -336,53 +374,6 @@ function idleSeconds() {
   })
 }
 
-function minuteOfDay(value) {
-  const match = /^(\d{2}):(\d{2})$/.exec(String(value))
-  if (!match) return null
-  const hour = Number(match[1])
-  const minute = Number(match[2])
-  if (hour > 23 || minute > 59) return null
-  return hour * 60 + minute
-}
-
-function quietHoursActive(config, now = new Date()) {
-  if (!config.quietHoursEnabled) return false
-  const start = minuteOfDay(config.quietStart)
-  const end = minuteOfDay(config.quietEnd)
-  if (start === null || end === null || start === end) return false
-  const currentMinute = now.getHours() * 60 + now.getMinutes()
-  return start < end
-    ? currentMinute >= start && currentMinute < end
-    : currentMinute >= start || currentMinute < end
-}
-
-function parseProjectRules(raw) {
-  try {
-    const value = JSON.parse(raw)
-    if (!Array.isArray(value)) return []
-    return value.slice(0, 50).flatMap((item) => {
-      const path = typeof item?.path === 'string' ? item.path.trim() : ''
-      const mode = item?.mode
-      if (!path || !['mute', 'errors', 'important'].includes(mode)) return []
-      return [{ path: resolve(path), mode }]
-    })
-  } catch {
-    return []
-  }
-}
-
-function matchingProjectRule(rules, cwd) {
-  if (!cwd) return null
-  const target = resolve(cwd)
-  return rules
-    .filter((rule) => target === rule.path || target.startsWith(`${rule.path}/`))
-    .sort((a, b) => b.path.length - a.path.length)[0] ?? null
-}
-
-function isCriticalKind(kind) {
-  return kind === '出错' || kind === '被阻止' || kind === '审批'
-}
-
 function applyImpl(ctx, config) {
   // 配置三层叠加：schema 默认值 < cordis 组合层（base = 插件 config）< 用户层（设置页）。
   // 设置页写入后经 watch 实时生效，不需要重启。
@@ -398,15 +389,36 @@ function applyImpl(ctx, config) {
   // 合并窗口内待发的轮次结束通知（实时通道）
   let pending = []
   let flushTimer = null
-  // digest 通道：只攒「完成」
+  // digest 通道：只攒「完成」；发送时刻绑定在已积累的批次上，设置变更不重置已排定的 deadline
   let digestPending = []
   let digestTimer = null
+  let digestDeadline = 0
   // 最近的通知决策，仅保存在当前进程内；设置页用于解释“为什么没弹”。
   let diagnostics = []
   let diagnosticSeq = 0
   // 重复错误键 -> 首次发送时间、被抑制次数
-  const duplicates = new Map()
+  let duplicates = new DuplicateTracker()
   let projectRules = parseProjectRules(current.projectRulesJson)
+
+  // —— 状态持久化：通知决策、重复合并、会话标题。防抖落盘，退出时立即 flush ——
+  const stateFile = stateFilePath()
+  let persistTimer = null
+  const schedulePersist = () => {
+    if (persistTimer) return
+    persistTimer = setTimeout(() => {
+      persistTimer = null
+      saveState(stateFile, {
+        diagnostics,
+        duplicates: duplicates.toJSON(),
+        titles: [...titles.entries()],
+      }).catch((err) => console.warn('[dsh-macos-notify] state persist failed:', err?.message ?? err))
+    }, 500)
+    persistTimer.unref?.()
+  }
+  const restored = loadStateSync(stateFile)
+  if (diagnostics.length === 0 && restored.diagnostics.length) diagnostics = restored.diagnostics
+  if (duplicates.size === 0 && restored.duplicates.length) duplicates = DuplicateTracker.fromJSON(restored.duplicates)
+  if (titles.size === 0 && restored.titles.length) for (const [id, title] of restored.titles) titles.set(id, title)
 
   const record = (status, item, detail, extra = {}) => {
     diagnostics.unshift({
@@ -423,6 +435,7 @@ function applyImpl(ctx, config) {
       ...extra,
     })
     if (diagnostics.length > MAX_DIAGNOSTICS) diagnostics.length = MAX_DIAGNOSTICS
+    schedulePersist()
   }
 
   // 通知通道：auto 在支持的终端里走 OSC 9（终端自己转系统通知），否则 osascript
@@ -536,9 +549,21 @@ function applyImpl(ctx, config) {
             return { ok: false, error: { code: 'internal', message: String(err?.message ?? err), details: {} } }
           }
         }
+        if (endpoint === 'sound/preview') {
+          try {
+            await previewSound(typeof payload?.name === 'string' ? payload.name.trim() : '')
+            return { ok: true, value: null }
+          } catch (err) {
+            console.warn('[dsh-macos-notify] sound preview failed:', err?.message ?? err)
+            return { ok: false, error: { code: 'internal', message: String(err?.message ?? err), details: {} } }
+          }
+        }
         if (endpoint === 'diagnostics') {
           const op = payload?.op ?? 'get'
-          if (op === 'clear') diagnostics = []
+          if (op === 'clear') {
+            diagnostics = []
+            schedulePersist()
+          }
           anyFocused()
           return {
             ok: true,
@@ -552,6 +577,7 @@ function applyImpl(ctx, config) {
                 pauseUntil: current.pauseUntil,
                 pending: pending.length,
                 digestPending: digestPending.length,
+                digestDeadline,
               },
             },
           }
@@ -563,7 +589,7 @@ function applyImpl(ctx, config) {
           if (op === 'set' && typeof payload.field === 'string') {
             try {
               await scope.update({ [payload.field]: payload.value })
-              return { ok: true, value: null }
+              return { ok: true, value: scope.get() }
             } catch (err) {
               return { ok: false, error: { code: 'internal', message: String(err?.message ?? err), details: {} } }
             }
@@ -655,22 +681,25 @@ function applyImpl(ctx, config) {
   }
 
   const applyDuplicatePolicy = (item) => {
-    if (!['出错', '被阻止'].includes(item.kind) || current.duplicateWindowSec <= 0) return true
-    const now = Date.now()
-    const key = `${item.sessionId ?? ''}\u0000${item.kind}\u0000${item.body}`
-    const previous = duplicates.get(key)
-    const windowMs = current.duplicateWindowSec * 1000
-    if (previous && now - previous.at < windowMs) {
-      previous.count += 1
-      record('suppressed', item, `重复通知已合并（本窗口第 ${previous.count} 次）`)
+    if (!['出错', '被阻止'].includes(item.kind)) return true
+    const decision = duplicates.admit(duplicateKey(item), Date.now(), current.duplicateWindowSec * 1000)
+    schedulePersist()
+    if (!decision.send) {
+      record('suppressed', item, `重复通知已合并（本窗口第 ${decision.count} 次）`)
       return false
     }
-    if (previous?.count) item.body += `（此前重复 ${previous.count} 次）`
-    duplicates.set(key, { at: now, count: 0 })
-    for (const [candidate, value] of duplicates) {
-      if (now - value.at > Math.max(windowMs * 2, 60_000)) duplicates.delete(candidate)
-    }
+    if (decision.suffix) item.body += decision.suffix
     return true
+  }
+
+  // 键鼠空闲查询要 fork ioreg，5 秒内复用上次结果
+  const idleCache = new TtlCache(5000)
+  const idleSecondsCached = async () => {
+    const cached = idleCache.get(Date.now())
+    if (cached.hit) return cached.value
+    const idle = await idleSeconds()
+    idleCache.set(Date.now(), idle)
+    return idle
   }
 
   // 发送前再检查实时策略；摘要可能在进入队列后才跨入勿扰时段。
@@ -679,17 +708,17 @@ function applyImpl(ctx, config) {
     if (allowed.length === 0) return
     if (current.onlyWhenUnfocused && anyFocused()) {
       allowed = allowed.filter((item) => {
-        if (item.kind !== '完成' || item.important) return true
+        if (!isCompletionKind(item.kind) || item.important) return true
         record('suppressed', item, 'DSH Web 页面当前处于聚焦状态')
         return false
       })
     }
-    const idleCandidates = allowed.filter((item) => item.kind === '完成' && !item.important)
+    const idleCandidates = allowed.filter((item) => isCompletionKind(item.kind) && !item.important)
     if (current.onlyWhenIdleSec > 0 && idleCandidates.length) {
-      const idle = await idleSeconds()
+      const idle = await idleSecondsCached()
       if (idle < current.onlyWhenIdleSec) {
         allowed = allowed.filter((item) => {
-          if (item.kind !== '完成' || item.important) return true
+          if (!isCompletionKind(item.kind) || item.important) return true
           record('suppressed', item, `键鼠仅空闲 ${Math.floor(idle)} 秒，要求 ${current.onlyWhenIdleSec} 秒`)
           return false
         })
@@ -743,40 +772,52 @@ function applyImpl(ctx, config) {
     })
   }
 
-  const setupDigest = () => {
+  // 摘要按绝对 deadline 触发：入队时排定，设置变更只重挂定时器、不重置等待时间；
+  // 关闭摘要时立即发掉已积累的批次，避免通知滞留。
+  const armDigest = () => {
     if (digestTimer) {
-      clearInterval(digestTimer)
+      clearTimeout(digestTimer)
       digestTimer = null
     }
-    if (current.digestMinutes > 0) {
-      digestTimer = setInterval(flushDigest, current.digestMinutes * 60_000)
+    if (current.digestMinutes <= 0 || digestPending.length === 0) {
+      digestDeadline = 0
+      return
     }
+    if (!digestDeadline) digestDeadline = Date.now() + current.digestMinutes * 60_000
+    digestTimer = setTimeout(() => {
+      digestTimer = null
+      digestDeadline = 0
+      flushDigest()
+    }, Math.max(0, digestDeadline - Date.now()))
+    digestTimer.unref?.()
   }
-  setupDigest()
 
-  // 设置页写入实时生效：换配置快照、重算通道、按新间隔重建 digest 定时器
+  // 设置页写入实时生效：换配置快照、重算通道、按新间隔重挂 digest 定时器
   scope.watch((next) => {
     current = next
     resolvedChannel = resolveChannel()
     projectRules = parseProjectRules(current.projectRulesJson)
-    setupDigest()
+    if (current.digestMinutes <= 0 && digestPending.length) flushDigest()
+    armDigest()
   })
 
   const enqueue = (kind, title, body, sound, session, options = {}) => {
     const item = makeItem(kind, title, body, sound, session)
     if (!applyProjectRule(item)) return
-    if (kind === '完成' && options.durationSec < current.minDurationSec && !item.important) {
+    if (isCompletionKind(kind) && options.durationSec < current.minDurationSec && !item.important) {
       record('suppressed', item, `任务耗时 ${options.durationSec.toFixed(1)} 秒，短于 ${current.minDurationSec} 秒`)
       return
     }
     if (!applyDuplicatePolicy(item)) return
-    if (kind === '完成' && current.digestMinutes > 0) {
+    if (isCompletionKind(kind) && current.digestMinutes > 0) {
       digestPending.push(item)
       record('queued', item, `已进入 ${current.digestMinutes} 分钟摘要队列`)
+      armDigest()
       return
     }
     if (current.coalesceMs <= 0) {
       void gateAndNotify([item], (allowed) => {
+        const { title, body, sound } = render(allowed)
         send(title, body + runningSuffix(), sound, allowed)
       })
       return
@@ -788,7 +829,10 @@ function applyImpl(ctx, config) {
 
   ctx.on('session/event', (session, event) => {
     if (event.type === 'session/title') {
+      // 标题按会话累积，封顶避免长驻进程缓慢泄漏
+      if (titles.size >= 200) titles.delete(titles.keys().next().value)
       titles.set(session.id, event.data.title)
+      schedulePersist()
       return
     }
 
@@ -842,10 +886,12 @@ function applyImpl(ctx, config) {
     if (event.type === 'approval/asked' && current.onApproval) {
       // 审批需要人处理，立即发，不合并
       const reason = event.data.reason ? ` — ${event.data.reason}` : ''
-      const body = `${label(session)}: ${event.data.toolName}${reason}`
-      const item = makeItem('审批', '等待审批', body, current.sounds.approval, session)
+      const item = makeItem('审批', '等待审批', `${label(session)}: ${event.data.toolName}${reason}`, current.sounds.approval, session)
       if (applyProjectRule(item)) {
-        void gateAndNotify([item], (allowed) => send('等待审批', body, current.sounds.approval, allowed))
+        void gateAndNotify([item], (allowed) => {
+          const { title, body, sound } = render(allowed)
+          send(title, body, sound, allowed)
+        })
       }
     } else if (event.type === 'approval/asked') {
       record('suppressed', makeItem('审批', '等待审批', label(session), current.sounds.approval, session), '审批通知已关闭')
@@ -856,6 +902,15 @@ function applyImpl(ctx, config) {
   ctx.effect(() => () => {
     if (flushTimer) clearTimeout(flushTimer)
     if (digestTimer) clearInterval(digestTimer)
+    if (persistTimer) {
+      clearTimeout(persistTimer)
+      persistTimer = null
+    }
+    saveState(stateFile, {
+      diagnostics,
+      duplicates: duplicates.toJSON(),
+      titles: [...titles.entries()],
+    }).catch(() => {})
   })
 }
 
