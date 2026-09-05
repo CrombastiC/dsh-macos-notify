@@ -58,8 +58,18 @@ export function matchingProjectRule(rules, cwd) {
     .sort((a, b) => b.path.length - a.path.length)[0] ?? null
 }
 
+/** 重复指纹归一化：只收敛已知易变片段（UUID、长 token、带单位的数量/时长），
+ *  裸数字（状态码、端口、行号）原样保留，避免把不同错误合并成同一个 */
+export function normalizeDuplicateText(text) {
+  let value = String(text ?? '').replace(/\s+/g, ' ').trim()
+  value = value.replace(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g, '<uuid>')
+  value = value.replace(/(?<![0-9a-zA-Z_])[0-9a-fA-F]{16,}(?![0-9a-zA-Z_])/gi, '<token>')
+  value = value.replace(/(\d+(?:\.\d+)?)\s*(毫秒|秒|分钟|小时|次|个|MB|KB|GB|ms|s|min|seconds?|secs?)(?![0-9a-zA-Z_])/gi, '<n> $2')
+  return value.length > 500 ? value.slice(0, 500) : value
+}
+
 export function duplicateKey(item) {
-  return `${item.sessionId ?? ''}\u0000${item.kind}\u0000${item.body}`
+  return `${item.sessionId ?? ''}\u0000${item.kind}\u0000${normalizeDuplicateText(item.body)}`
 }
 
 /**
@@ -108,12 +118,112 @@ export class DuplicateTracker {
   }
 }
 
+/** 声音事件字段；服务端与客户端共享同一集合 */
+export const SOUND_KINDS = ['completed', 'error', 'aborted', 'approval']
+
+export const MAX_NOTIFICATION_TITLE = 120
+export const MAX_NOTIFICATION_BODY = 500
+
+/** 通知文案截断（内容策略）：标题/正文各自封顶并加省略号；通道级的总长限制另算 */
+export function truncateNotification(title, body) {
+  const trim = (value, max) => {
+    const text = String(value ?? '')
+    return text.length > max ? `${text.slice(0, max - 1)}…` : text
+  }
+  return { title: trim(title, MAX_NOTIFICATION_TITLE), body: trim(body, MAX_NOTIFICATION_BODY) }
+}
+
 /** AppleScript 字符串转义 + 通知脚本组装；换行会截断 display notification 的字面量，压成空格 */
 export function buildNotificationScript(title, body, sound) {
+  const truncated = truncateNotification(title, body)
   const clean = (value) => String(value).replace(/\r?\n/g, ' ')
   const quote = (value) => value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
   const soundPart = sound ? ` sound name "${quote(sound)}"` : ''
-  return `display notification "${quote(clean(body))}" with title "${quote(clean(title))}"${soundPart}`
+  return `display notification "${quote(clean(truncated.body))}" with title "${quote(clean(truncated.title))}"${soundPart}`
+}
+
+/** settings set/patch 共用的可编辑字段与校验（服务端唯一真相；客户端只做输入提示） */
+export const EDITABLE_SETTINGS = new Set([
+  'onCompleted', 'onError', 'onAborted', 'onApproval', 'minDurationSec',
+  'onlyWhenIdleSec', 'onlyWhenUnfocused', 'digestMinutes', 'includeSubagents',
+  'channel', 'sounds', 'coalesceMs', 'quietHoursEnabled', 'quietStart', 'quietEnd',
+  'quietAllowCritical', 'pauseUntil', 'duplicateWindowSec', 'projectRulesJson',
+])
+/** 数值字段的合法区间（与客户端 NUMBER_BOUNDS 一致，服务端强制执行） */
+export const NUMBER_BOUNDS = {
+  minDurationSec: [0, 3600],
+  onlyWhenIdleSec: [0, 3600],
+  digestMinutes: [0, 1440],
+  coalesceMs: [0, 60000],
+  duplicateWindowSec: [0, 86400],
+}
+const BOOLEAN_SETTINGS = new Set([
+  'onCompleted', 'onError', 'onAborted', 'onApproval',
+  'onlyWhenUnfocused', 'includeSubagents', 'quietHoursEnabled', 'quietAllowCritical',
+])
+const CHANNELS = new Set(['auto', 'osascript', 'osc9'])
+
+export function assertProjectRulesJson(raw) {
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('项目规则格式无效')
+  }
+  if (!Array.isArray(parsed) || parsed.length > 50) throw new Error('项目规则格式无效')
+  if (parsed.some((rule) => typeof rule?.path !== 'string' || !['mute', 'errors', 'important'].includes(rule?.mode))) {
+    throw new Error('项目规则格式无效')
+  }
+  return raw
+}
+
+function validateSettingsField(field, value, current) {
+  if (BOOLEAN_SETTINGS.has(field)) {
+    if (typeof value !== 'boolean') throw new Error(`${field} 必须为布尔值`)
+    return value
+  }
+  if (NUMBER_BOUNDS[field]) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${field} 必须为有限数值`)
+    const [min, max] = NUMBER_BOUNDS[field]
+    if (value < min || value > max) throw new Error(`${field} 超出范围 [${min}, ${max}]`)
+    return value
+  }
+  if (field === 'pauseUntil') {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error('pauseUntil 必须为非负数值')
+    return value
+  }
+  if (field === 'channel') {
+    if (!CHANNELS.has(value)) throw new Error('channel 取值无效')
+    return value
+  }
+  if (field === 'quietStart' || field === 'quietEnd') {
+    if (minuteOfDay(value) === null) throw new Error('勿扰时间格式无效')
+    return value
+  }
+  if (field === 'sounds') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('sounds 格式无效')
+    for (const [kind, name] of Object.entries(value)) {
+      if (!SOUND_KINDS.includes(kind)) throw new Error(`未知的声音字段：${kind}`)
+      if (typeof name !== 'string') throw new Error(`声音 ${kind} 必须为字符串`)
+    }
+    return { ...(current?.sounds ?? {}), ...value }
+  }
+  if (field === 'projectRulesJson') {
+    if (typeof value !== 'string') throw new Error('项目规则格式无效')
+    return assertProjectRulesJson(value)
+  }
+  throw new Error(`不可编辑的设置字段：${field}`)
+}
+
+/** 校验并归一化设置 patch；set 端点用单字段对象调用同一入口 */
+export function validateSettingsPatch(patch, current = {}) {
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('设置格式无效')
+  const normalized = {}
+  for (const [field, value] of Object.entries(patch)) {
+    if (!EDITABLE_SETTINGS.has(field)) throw new Error('包含不可编辑的设置字段')
+    normalized[field] = validateSettingsField(field, value, current)
+  }
+  return normalized
 }
 
 /** 极简 TTL 缓存：命中返回 { hit: true, value }，过期或未填充返回 { hit: false } */

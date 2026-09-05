@@ -7,15 +7,17 @@ import { promisify } from 'node:util'
 import Schema from '@deepseek-ai/schemastery'
 import {
   DuplicateTracker,
+  SOUND_KINDS,
   TtlCache,
   buildNotificationScript,
   duplicateKey,
   isCompletionKind,
   isCriticalKind,
   matchingProjectRule,
-  minuteOfDay,
   parseProjectRules,
   quietHoursActive,
+  truncateNotification,
+  validateSettingsPatch,
 } from './src/policy.js'
 import { loadStateSync, saveState } from './src/state.js'
 
@@ -70,8 +72,6 @@ export const Config = Schema.object({
   notifyOnLoad: Schema.boolean().default(false),
 })
 
-/** 设置页可编辑的提示音字段 */
-const SOUND_KINDS = ['completed', 'error', 'aborted', 'approval']
 const SOUND_EXTENSIONS = new Set(['.aif', '.aiff', '.caf', '.m4a', '.wav'])
 const IMPORT_EXTENSIONS = new Set([
   '.aac', '.aif', '.aiff', '.caf', '.flac', '.m4a', '.mp3', '.oga', '.ogg', '.opus', '.wav',
@@ -354,7 +354,8 @@ function sanitizeOsc9(s) {
 }
 
 function emitOsc9(title, body) {
-  const message = [title, body].map(sanitizeOsc9).filter(Boolean).join(': ').slice(0, 256)
+  const truncated = truncateNotification(title, body)
+  const message = [truncated.title, truncated.body].map(sanitizeOsc9).filter(Boolean).join(': ').slice(0, 256)
   if (!message) return
   let seq = `\x1b]9;${message}\x07`
   // tmux 会吞掉 OSC，需要 DCS passthrough 包裹并把载荷里的 ESC 双写
@@ -588,7 +589,7 @@ function applyImpl(ctx, config) {
           if (op === 'get') return { ok: true, value: scope.get() }
           if (op === 'set' && typeof payload.field === 'string') {
             try {
-              await scope.update({ [payload.field]: payload.value })
+              await scope.update(validateSettingsPatch({ [payload.field]: payload.value }, current))
               return { ok: true, value: scope.get() }
             } catch (err) {
               return { ok: false, error: { code: 'internal', message: String(err?.message ?? err), details: {} } }
@@ -596,24 +597,7 @@ function applyImpl(ctx, config) {
           }
           if (op === 'patch' && payload.value && typeof payload.value === 'object' && !Array.isArray(payload.value)) {
             try {
-              const editable = new Set([
-                'onCompleted', 'onError', 'onAborted', 'onApproval', 'minDurationSec',
-                'onlyWhenIdleSec', 'onlyWhenUnfocused', 'digestMinutes', 'includeSubagents',
-                'channel', 'sounds', 'coalesceMs', 'quietHoursEnabled', 'quietStart', 'quietEnd',
-                'quietAllowCritical', 'pauseUntil', 'duplicateWindowSec', 'projectRulesJson',
-              ])
-              if (Object.keys(payload.value).some((key) => !editable.has(key))) throw new Error('包含不可编辑的设置字段')
-              for (const field of ['quietStart', 'quietEnd']) {
-                if (field in payload.value && minuteOfDay(payload.value[field]) === null) throw new Error('勿扰时间格式无效')
-              }
-              if (typeof payload.value.projectRulesJson === 'string') {
-                const parsed = JSON.parse(payload.value.projectRulesJson)
-                if (!Array.isArray(parsed) || parsed.length > 50) throw new Error('项目规则格式无效')
-                if (parsed.some((rule) => typeof rule?.path !== 'string' || !['mute', 'errors', 'important'].includes(rule?.mode))) {
-                  throw new Error('项目规则格式无效')
-                }
-              }
-              await scope.update(payload.value)
+              await scope.update(validateSettingsPatch(payload.value, current))
               return { ok: true, value: scope.get() }
             } catch (err) {
               return { ok: false, error: { code: 'internal', message: String(err?.message ?? err), details: {} } }

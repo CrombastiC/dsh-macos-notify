@@ -13,7 +13,7 @@ Native macOS notifications for [DeepSeek Harness](https://github.com/deepseek-ai
 - A six-event test matrix validates completed, error, approval, aborted, coalesced, and digest notifications.
 - Daily quiet hours and temporary pauses with custom durations and a remaining-time display.
 - Common toggles and the sound picker save instantly from the read-only view; number inputs are clamped to safe ranges.
-- Duplicate error suppression with a configurable cooldown window.
+- Duplicate error suppression with a configurable cooldown window and volatile-fragment normalization.
 - Project path rules for muting, error-only alerts, or important-project bypasses.
 - Minimum turn-duration filtering avoids notifications for near-instant replies.
 - Optional Web-tab focus suppression and macOS HID idle-time gating.

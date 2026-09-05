@@ -6,6 +6,9 @@ import {
   TtlCache,
   buildNotificationScript,
   duplicateKey,
+  normalizeDuplicateText,
+  truncateNotification,
+  validateSettingsPatch,
   isCompletionKind,
   isCriticalKind,
   matchingProjectRule,
@@ -135,4 +138,58 @@ test('DuplicateTracker serializes to and from plain entries', () => {
   assert.equal(tracker.size, 1)
   const restored = DuplicateTracker.fromJSON(tracker.toJSON())
   assert.deepEqual(restored.admit('k', 3000, 60_000), { send: false, count: 2 })
+})
+
+test('validateSettingsPatch enforces editable fields, ranges and formats', () => {
+  const current = { sounds: { completed: 'Glass', error: 'Basso', aborted: '', approval: 'Ping' } }
+  assert.deepEqual(validateSettingsPatch({ minDurationSec: 45 }, current), { minDurationSec: 45 })
+  assert.deepEqual(validateSettingsPatch({ sounds: { completed: 'Ping' } }, current),
+    { sounds: { completed: 'Ping', error: 'Basso', aborted: '', approval: 'Ping' } })
+  assert.throws(() => validateSettingsPatch({ notifyOnLoad: true }, current), /不可编辑/)
+  assert.throws(() => validateSettingsPatch({ minDurationSec: 99999 }, current), /超出范围/)
+  assert.throws(() => validateSettingsPatch({ minDurationSec: '30' }, current), /必须为有限数值/)
+  assert.throws(() => validateSettingsPatch({ onCompleted: 1 }, current), /必须为布尔值/)
+  assert.throws(() => validateSettingsPatch({ channel: 'sms' }, current), /取值无效/)
+  assert.throws(() => validateSettingsPatch({ quietStart: '25:00' }, current), /勿扰时间格式无效/)
+  assert.throws(() => validateSettingsPatch({ projectRulesJson: 'not json' }, current), /项目规则格式无效/)
+  assert.throws(() => validateSettingsPatch({ sounds: { nope: 'X' } }, current), /未知/)
+  assert.throws(() => validateSettingsPatch(null, current), /设置格式无效/)
+})
+
+test('normalizeDuplicateText converges volatile fragments but keeps distinguishing codes', () => {
+  assert.equal(
+    normalizeDuplicateText('proj: 请求被限流（429），服务商建议 60 秒后重试'),
+    normalizeDuplicateText('proj: 请求被限流（429），服务商建议 30 秒后重试'))
+  assert.notEqual(
+    normalizeDuplicateText('proj: task failed 429'),
+    normalizeDuplicateText('proj: task failed 500'))
+  assert.equal(
+    normalizeDuplicateText('req 8f3a2b1c-4d5e-6f70-8234-56789abcdef0 failed after 1.5 秒'),
+    'req <uuid> failed after <n> 秒')
+  assert.equal(normalizeDuplicateText('a   b\nc'), 'a b c')
+  assert.equal(
+    normalizeDuplicateText('retry after 30 seconds'),
+    normalizeDuplicateText('retry after 45 seconds'))
+  assert.equal(normalizeDuplicateText('retry after 30s'), 'retry after <n> s')
+  assert.equal(normalizeDuplicateText('x'.repeat(600)).length, 500)
+})
+
+test('duplicateKey ignores volatile fragments across sends', () => {
+  const a = duplicateKey({ sessionId: 's1', kind: '出错', body: 'proj: 限流，建议 60 秒后重试' })
+  const b = duplicateKey({ sessionId: 's1', kind: '出错', body: 'proj: 限流，建议 30 秒后重试' })
+  assert.equal(a, b)
+})
+
+test('truncateNotification caps title and body with an ellipsis', () => {
+  assert.deepEqual(truncateNotification('T', 'B'), { title: 'T', body: 'B' })
+  const long = truncateNotification('t'.repeat(130), 'b'.repeat(600))
+  assert.equal(long.title.length, 120)
+  assert.ok(long.title.endsWith('…'))
+  assert.equal(long.body.length, 500)
+  assert.ok(long.body.endsWith('…'))
+})
+
+test('buildNotificationScript truncates long bodies', () => {
+  const script = buildNotificationScript('T', 'b'.repeat(600), '')
+  assert.ok(script.includes('b'.repeat(499) + '…'))
 })
