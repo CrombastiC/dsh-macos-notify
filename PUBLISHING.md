@@ -21,6 +21,20 @@
 - 账号开启了发布时二次验证。`npm publish` 会报 `EOTP` 并给出网页授权 URL，在浏览器完成授权后发布才继续。
 - **CLI 进程退出而未完成授权 = 什么都没发出去**。用 `npm view` 确认 registry 上的实际版本，别凭 publish 命令的输出判断。
 
+## publish 报 E404（Not found / no permission）
+
+- 这是**认证通过、鉴权被拒**：npm 对无权限发布统一返回 404 而不是 403。先排除 E401（token 已死，见上）和 EOTP（2FA 未完成）。
+- 定案两步（必须在**发布用的那个终端**里跑，官方源）：
+
+  ```bash
+  npm whoami --registry=https://registry.npmjs.org/
+  npm view dsh-macos-notify maintainers --registry=https://registry.npmjs.org/ --prefer-online
+  ```
+
+- **whoami 不是包维护者**：登错号了，`npm logout` 后用维护者账号重登。
+- **whoami 是维护者但依然 404**：token 是 granular token 且没给这个包写权限。去 npmjs.com → Access Tokens，把该 token 的 Packages and scopes 改成 Read and write 并覆盖本包；或删掉重走 `npm login` 拿一枚全权限 token。
+- 不同终端会话可能用不同凭据（项目级 `.npmrc`、shell 环境变量、publish 时的临时参数）。排障一律以发布终端的 `whoami` 为准，别处的只能参考。
+
 ## 发布清单（按序执行）
 
 1. `main` 干净且与 `origin/main` 同步
@@ -33,7 +47,7 @@
 8. 发布后三件套校验：
 
    ```bash
-   npm view dsh-macos-notify version dist-tags.latest dist.integrity --prefer-online
+   npm view dsh-macos-notify version dist-tags.latest dist.integrity --registry=https://registry.npmjs.org/ --prefer-online
    ```
 
    `version` / `dist-tags.latest` 应为新版本号，`dist.integrity` 必须与第 5 步留档值逐字一致——一致才能确认 registry 上的就是本地打包内容。
@@ -41,3 +55,4 @@
 ## 历史踩坑记录
 
 - 0.4.0 发布时：先 `EOTP` 中断（进程退出后 registry 仍是 0.3.0），在主检出目录重新 `npm publish` 浏览器授权后成功；integrity 比对通过。
+- 0.4.1 发布时：PUT 报 E404。排查确认 `~/.npmrc` 的旧 token 已 E401，发布终端另有会话级凭据（认证通过但无写权限）；registry 保持 0.4.0 未受影响。待 token 权限修复后重发并做三件套校验。
