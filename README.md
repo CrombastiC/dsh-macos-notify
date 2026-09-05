@@ -42,6 +42,12 @@ Alternatively, install the latest source directly from GitHub:
 npx -y @deepseek-ai/dsh plugin --profile web add github:CrombastiC/dsh-macos-notify
 ```
 
+The full git URL form works identically (installs a snapshot of `main`):
+
+```bash
+npx -y @deepseek-ai/dsh plugin --profile web add https://github.com/CrombastiC/dsh-macos-notify
+```
+
 Then open **Settings → macOS notifications** from the first-level settings navigation.
 
 To remove the plugin:
